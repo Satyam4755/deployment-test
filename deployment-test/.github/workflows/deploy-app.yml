@@ -5,9 +5,8 @@ name: Deploy Application
 # - It cannot read vault, cannot become root, cannot change infrastructure.
 # - It runs two root-owned scripts: erp-deploy and erp-smoke.
 # - Production requires approval from a designated reviewer (no self-review).
-# - Development runs first; a failed development smoke never creates a
-#   production job. A manual production dispatch is a re-deploy of a digest
-#   and still goes through the production environment's approval.
+# - Production runs only when explicitly requested via workflow_dispatch.
+#   A development deployment never triggers or queues production.
 # - A rollback is a deploy of an older digest. There is no separate job.
 
 on:
@@ -64,13 +63,36 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            if [ -z "$PAYLOAD_DIGEST" ]; then
+              echo "::error::Missing client_payload.digest in repository_dispatch event"
+              exit 1
+            fi
+            if [ -z "$PAYLOAD_ENVIRONMENT" ]; then
+              echo "::error::Missing client_payload.environment in repository_dispatch event (must be exactly 'development')"
+              exit 1
+            fi
+            if [ "$PAYLOAD_ENVIRONMENT" != "development" ]; then
+              echo "::error::Automated repository_dispatch can only deploy to 'development'. Received: '$PAYLOAD_ENVIRONMENT'"
+              exit 1
+            fi
             DIGEST="$PAYLOAD_DIGEST"
-            ENV="${PAYLOAD_ENVIRONMENT:-development}"
+            ENV="$PAYLOAD_ENVIRONMENT"
             ACTOR="${PAYLOAD_ACTOR:-$DEFAULT_ACTOR}"
-          else
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_DIGEST" ]; then
+              echo "::error::Missing digest input in workflow_dispatch"
+              exit 1
+            fi
+            if [ -z "$INPUT_ENVIRONMENT" ]; then
+              echo "::error::Missing environment input in workflow_dispatch"
+              exit 1
+            fi
             DIGEST="$INPUT_DIGEST"
             ENV="$INPUT_ENVIRONMENT"
             ACTOR="$DEFAULT_ACTOR"
+          else
+            echo "::error::Unsupported event trigger: $EVENT_NAME"
+            exit 1
           fi
 
           # Validate digest format
@@ -184,15 +206,12 @@ jobs:
 
   deploy-production:
     name: Deploy Production
-    needs: [prepare, deploy-development]
-    # Normal flow: development succeeded, so production runs and waits for
-    # approval. Manual flow: environment=production re-deploys a known digest
-    # and still waits for approval.
+    needs: [prepare]
+    # Production runs ONLY when explicitly requested through workflow_dispatch with environment production.
+    # A development deployment never triggers or queues production.
     if: |
-      always() && (
-        needs.prepare.outputs.environment == 'production' ||
-        (needs.prepare.outputs.environment == 'development' && needs.deploy-development.result == 'success')
-      )
+      github.event_name == 'workflow_dispatch' &&
+      needs.prepare.outputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
     # Requires reviewer approval; self-review disabled in environment settings

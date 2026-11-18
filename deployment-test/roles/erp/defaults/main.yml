@@ -3,7 +3,7 @@
 # is a confidential identifier and is defined once in group_vars/all/main.yml
 # as `{{ vault_app_image_repository }}`. The identity here is either a tag
 # (provisioning default) or, for a deploy, the repository plus a sha256 digest.
-erp_image_version: "1.16.8"
+erp_image_version: "1.16.9"
 erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
 
 # --- initial site configuration -----------------------------------------

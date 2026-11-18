@@ -45,7 +45,7 @@ ansible_retries: 3
 # The image repository names the registry namespace the business owns, so it
 # is a confidential identifier and lives in the vault. See ADR-026.
 erp_image_repository: "{{ vault_app_image_repository | mandatory }}"
-erp_image_version: "1.16.8"
+erp_image_version: "1.16.9"
 erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
 traefik_image: "traefik:v3.7.13"
 socket_proxy_image: "lscr.io/linuxserver/socket-proxy:3.4.7"
