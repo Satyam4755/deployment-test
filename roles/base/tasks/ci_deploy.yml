@@ -17,7 +17,6 @@
       vault_ci_deploy_authorized_keys must be a non-empty list of SSH public
       keys in group_vars/{{ env_name }}/vault.yml. Generate the key pair first
       (see SECRETS.md#generating-the-ci-key).
-    quiet: true
   tags: [base, ci_deploy]
 
 - name: Create ci-deploy user
@@ -43,17 +42,12 @@
 
 - name: Install ci-deploy authorized keys
   # exclusive: true replaces the file, so a rotated key is genuinely revoked.
-  ansible.builtin.copy:
-    dest: "/home/{{ ci_deploy_user }}/.ssh/authorized_keys"
-    owner: "{{ ci_deploy_user }}"
-    group: "{{ ci_deploy_user }}"
-    mode: '0600'
+  ansible.posix.authorized_key:
+    user: "{{ ci_deploy_user }}"
+    key: "{{ ci_deploy_authorized_keys | join('\n') }}"
     exclusive: true
-    content: |
-      # Managed by Ansible (roles/base). Edits are overwritten.
-      {% for key in ci_deploy_authorized_keys %}
-      {{ key }}
-      {% endfor %}
+    manage_dir: false
+    state: present
   tags: [base, ci_deploy]
 
 - name: Install ci-deploy restricted sudo rule
@@ -94,22 +88,29 @@
     fail_msg: >-
       ci-deploy sudo rule grants unexpected commands. Output:
       {{ ci_deploy_sudo_check.stdout }}
-    quiet: true
   tags: [base, ci_deploy]
 
-- name: Assert ci-deploy has no supplementary groups
+- name: Read ci-deploy group IDs
   ansible.builtin.command:
-    cmd: id -nG {{ ci_deploy_user }}
+    cmd: id -G {{ ci_deploy_user }}
   register: ci_deploy_groups
   changed_when: false
-  failed_when: false
-  tags: [base, ci_deploy]
 
-- name: Fail if ci-deploy has any groups
-  ansible.builtin.fail:
-    msg: >-
-      ci-deploy has supplementary groups: {{ ci_deploy_groups.stdout }}.
-      It must have no groups.
-    quiet: true
-  when: ci_deploy_groups.stdout | length > 0
+- name: Read ci-deploy primary group ID
+  ansible.builtin.command:
+    cmd: id -g {{ ci_deploy_user }}
+  register: ci_deploy_primary_group
+  changed_when: false
+
+- name: Assert ci-deploy has no supplementary groups
+  ansible.builtin.assert:
+    that:
+      - >-
+        (ci_deploy_groups.stdout.split()
+        | difference([ci_deploy_primary_group.stdout]))
+        | length == 0
+    fail_msg: >-
+      ci-deploy has supplementary groups:
+      {{ ci_deploy_groups.stdout }}.
+    success_msg: "ci-deploy has no supplementary groups."
   tags: [base, ci_deploy]
