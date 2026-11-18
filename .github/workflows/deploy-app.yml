@@ -152,7 +152,7 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
 
           # Validate the key parses without ever printing its contents.
-          ssh-keygen -lf ~/.ssh/id_deploy > /dev/null && echo "SSH key parsed OK"
+          ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null && echo "SSH private key parsed OK"
 
       - name: Verify non-secret runtime variables are present
         env:
@@ -240,7 +240,7 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
 
           # Validate the key parses without ever printing its contents.
-          ssh-keygen -lf ~/.ssh/id_deploy > /dev/null && echo "SSH key parsed OK"
+          ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null && echo "SSH private key parsed OK"
 
       - name: Verify non-secret runtime variables are present
         env:
