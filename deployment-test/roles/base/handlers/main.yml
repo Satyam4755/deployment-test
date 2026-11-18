@@ -1,0 +1,106 @@
+---
+# Handlers run in the order they are defined, which is what makes the
+# safety ordering below work: validate, then act.
+
+# --- sshd ---------------------------------------------------------------
+# Validates the config on the host before reloading, and fails the run if it
+# is invalid. A failed restart on a machine reachable only over SSH is
+# unrecoverable, so this is checked twice: once by the `validate:` option on
+# every write in tasks/ssh.yml, and again here immediately before activation.
+- name: Verify the SSH configuration parses
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -t
+  register: base_sshd_check
+  changed_when: false
+  listen: Restart sshd
+
+- name: Restart sshd
+  # `reloaded`, not `restarted`: SIGHUP re-reads the config without dropping
+  # the live session this play is running over.
+  ansible.builtin.service:
+    name: ssh
+    state: reloaded
+  listen: Restart sshd
+
+- name: Read the effective SSH policy
+  # `sshd -T` prints the fully-resolved configuration, which is the only
+  # reliable way to confirm what sshd will actually do — Match blocks and
+  # Include ordering can make the file misleading.
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -T
+  register: base_sshd_effective
+  changed_when: false
+  failed_when: false
+  listen: Verify SSH access
+
+- name: Validate the SSH configuration during access verification
+  ansible.builtin.command:
+    cmd: /usr/sbin/sshd -t
+  register: base_sshd_access_check
+  changed_when: false
+  failed_when: false
+  listen: Verify SSH access
+
+- name: Fail loudly if the effective SSH policy is not what was intended
+  ansible.builtin.assert:
+    that:
+      - base_sshd_access_check.rc == 0
+      - "'permitrootlogin no' in base_sshd_effective.stdout"
+      - "'passwordauthentication no' in base_sshd_effective.stdout"
+      - "'pubkeyauthentication yes' in base_sshd_effective.stdout"
+      - "'allowusers ' ~ (base_allowed_ssh_users | join(' ')) in base_sshd_effective.stdout"
+    fail_msg: >-
+      The effective sshd policy does not match the intended hardening. If the
+      admin accounts are not all permitted to authenticate, this host is now
+      unreachable and needs console access. Inspect it with:
+      /usr/sbin/sshd -T
+    quiet: true
+  listen: Verify SSH access
+
+# --- sudo ---------------------------------------------------------------
+- name: Verify the sudoers drop-in parses
+  ansible.builtin.command:
+    cmd: /usr/sbin/visudo -cf /etc/sudoers.d/base-operators
+  register: base_visudo_check
+  changed_when: false
+  listen: Reload sudo
+
+# --- firewall -----------------------------------------------------------
+- name: Apply DOCKER-USER rules
+  # Shared with roles/docker, so it no-ops when the script is not present yet
+  # (Docker not installed on a first base-only run).
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/apply-docker-user-rules
+  register: base_docker_user
+  changed_when: "'DOCKER-USER' in base_docker_user.stderr | default(false)"
+  failed_when: false
+  listen: Apply DOCKER-USER rules
+
+- name: Reload UFW
+  community.general.ufw:
+    state: reloaded
+  listen: Reload ufw
+
+# --- system -------------------------------------------------------------
+- name: Reload sysctl
+  ansible.builtin.command:
+    cmd: sysctl --system
+  changed_when: true
+  listen: Reload sysctl
+
+- name: Restart journald
+  ansible.builtin.service:
+    name: systemd-journald
+    state: restarted
+  listen: Restart journald
+
+- name: Restart chrony
+  ansible.builtin.service:
+    name: chrony
+    state: restarted
+  listen: Restart chrony
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: Reload systemd

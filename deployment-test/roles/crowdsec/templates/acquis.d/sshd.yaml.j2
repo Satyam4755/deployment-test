@@ -1,0 +1,8 @@
+# SSH authentication log acquisition
+# Reads /logs/auth.log (host /var/log/auth.log mounted read-only)
+# Uses the sshd parser from crowdsecurity/linux collection.
+filenames:
+  - /logs/auth.log
+labels:
+  type: syslog
+---

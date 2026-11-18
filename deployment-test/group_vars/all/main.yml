@@ -1,0 +1,195 @@
+---
+# Shared defaults for ALL environments (dev + prod).
+# Env-specific values live in group_vars/<env>/main.yml.
+# Secrets live in group_vars/<env>/vault.yml (vault-id encrypted).
+#
+# This file is the single source of truth for the access model, so that
+# inventory/inventory.yml needs no per-host connection settings and the two
+# environments cannot drift apart.
+
+# --- environment selection ---
+# The only valid --limit targets. playbooks/guard.yml asserts against this
+# list, which is what makes a single-inventory / two-group layout safe.
+environment_groups:
+  - development
+  - production
+
+# --- connection / access model (identical for every environment) ---
+# Resolved at runtime; no IPs or usernames are ever committed to git.
+# SSH connects as the admin's named account. Ansible then escalates to root
+# with that admin's own sudo password; stack files are chowned to
+# deploy_owner_user explicitly by the roles.
+ansible_host: "{{ lookup('env', 'TARGET_SERVER_HOST') }}"
+ansible_user: "{{ lookup('env', 'SSH_LOGIN_USER') }}"
+ansible_port: "{{ lookup('env', 'SSH_PORT') | default(ssh_standard_port, true) }}"
+# Escalate to root with the admin's own sudo password. Admins have full sudo
+# by design; the stack roles write deployowner-owned files explicitly, so
+# root here does not change on-disk ownership.
+ansible_become_user: root
+ansible_become_method: sudo
+# Keep long-lived SSH sessions alive through slow `bench build` asset syncs.
+ansible_ssh_common_args: >-
+  -o ServerAliveInterval=60
+  -o ServerAliveCountMax=60
+  -o StrictHostKeyChecking=accept-new
+# Ansible controller-side pipelining; the remote side is enabled in
+# roles/base/handlers so both ends agree.
+ansible_pipelining: true
+ansible_retries: 3
+
+# --- images ---
+# Pinned, never `latest`. `erp_image_version` is the provisioning default
+# and human-readable label. A deploy pins `erp_image` to a sha256 digest;
+# see playbooks/update.yml and ADR-004.
+#
+# The image repository names the registry namespace the business owns, so it
+# is a confidential identifier and lives in the vault. See ADR-026.
+erp_image_repository: "{{ vault_app_image_repository | mandatory }}"
+erp_image_version: "1.16.8"
+erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
+traefik_image: "traefik:v3.7.13"
+socket_proxy_image: "lscr.io/linuxserver/socket-proxy:3.4.7"
+traefik_bouncer_plugin: "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
+traefik_bouncer_version: "v1.8.1"
+# Collections CrowdSec needs to parse Traefik's access log and to have
+# anything to decide on. Without crowdsecurity/traefik the bouncer receives no
+# parsed events and silently bans nothing.
+crowdsec_collections:
+  - crowdsecurity/traefik
+  - crowdsecurity/linux
+  - crowdsecurity/appsec-virtual-patching
+  - crowdsecurity/appsec-generic-rules
+
+# --- Cloudflare ---
+# Cloudflare's published edge ranges. One list, three uses:
+#   * entrypoint forwardedHeaders.trustedIPs - who may set X-Forwarded-For
+#   * the cloudflare-allow middleware - who may reach the origin
+#   * the CrowdSec bouncer plugin - whose X-Forwarded-For we believe
+# Keeping them in one place stops the three from drifting apart.
+cloudflare_ips:
+  - "173.245.48.0/20"
+  - "103.21.244.0/22"
+  - "103.22.200.0/22"
+  - "103.31.4.0/22"
+  - "141.101.64.0/18"
+  - "108.162.192.0/18"
+  - "190.93.240.0/20"
+  - "188.114.96.0/20"
+  - "197.234.240.0/22"
+  - "198.41.128.0/17"
+  - "162.158.0.0/15"
+  - "104.16.0.0/13"
+  - "104.24.0.0/14"
+  - "172.64.0.0/13"
+  - "131.0.72.0/22"
+  - "2400:cb00::/32"
+  - "2606:4700::/32"
+  - "2803:f800::/32"
+  - "2405:b500::/32"
+  - "2405:8100::/32"
+  - "2a06:98c0::/29"
+  - "2c0f:f248::/32"
+
+# Requests from these addresses may carry X-Forwarded-For. Everybody else has
+# that header removed by Traefik, so a visitor cannot pretend to be somebody
+# else. The private network ranges are deliberately NOT here: a host on the
+# LAN is not a proxy we trust.
+traefik_trusted_ips: "{{ cloudflare_ips + ['127.0.0.1/32'] }}"
+
+# Addresses allowed to reach the origin at all. The private ranges are here so
+# the server itself and the LAN can still get in; the open internet can only
+# come through Cloudflare.
+traefik_allowlist_ips: >-
+  {{ cloudflare_ips + ['127.0.0.1/32', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'] }}
+
+# When true, the ERP router only answers requests that came through
+# Cloudflare. Turn it on once the DNS record is proxied (orange cloud),
+# otherwise the site stops answering for everyone.
+traefik_origin_cloudflare_only: false
+redis_image: "redis:8.6-alpine"
+mariadb_image: "mariadb:11.8"
+
+# --- Frappe applications ---
+# List of Frappe apps to install on the site. The image's init script or the
+# configurator should install these. If empty, only the base Frappe framework
+# is installed.
+frappe_site_apps: []
+
+# --- generic ---
+# Supported host baseline. Documentation refers to this variable rather than
+# repeating an operating-system release that will go stale.
+base_os_release: "24.04"
+tz: "UTC"
+# Privileged owner on target hosts. Stack files and containers are owned by
+# this account; Ansible reaches it with `sudo -u deployowner` when a task must
+# run as the owner, and uses root for host-level changes.
+deploy_owner_user: "{{ lookup('env', 'DEPLOY_OWNER_USER') | default('deployowner', true) }}"
+deploy_owner_home: "/home/{{ deploy_owner_user }}"
+# The SSH port is a confidential identifier in the same sense as the hostname:
+# publishing it removes one obstacle for a scanner. It lives in the vault.
+ssh_standard_port: "{{ vault_ssh_port | mandatory }}"
+traefik_cert_resolver: "cloudflare"
+acme_staging_url: "https://acme-staging-v02.api.letsencrypt.org/directory"
+acme_prod_url: "https://acme-v02.api.letsencrypt.org/directory"
+
+# --- host hardening (roles/base, roles/docker) ---
+# Admin account names and public keys live in the encrypted vault as
+# vault_base_operators. They are not committed in plaintext, so the repository
+# does not publish who can log in or which keys are authorised. The matching
+# password hashes are also in the vault, under vault_operator_password_hashes.
+
+# --- Traefik standalone first: bouncer OFF until CrowdSec phase ---
+# playbooks/crowdsec.yml verifies the LAPI and then flips this in
+# group_vars/<env>/main.yml. Keep false until it does.
+traefik_crowdsec_enabled: false
+
+# --- Edge mode dependent values (set in group_vars/<env>/main.yml) ---
+# traefik_cert_resolver: "http" | "cloudflare"
+# traefik_trusted_ips: list of IPs whose X-Forwarded-For Traefik trusts
+# traefik_origin_cloudflare_only: boolean
+
+# --- confidential identifier indirection ---------------------------------
+# Domains, hostnames, organisation and registry names, bucket names and
+# personal identities are not secrets in the cryptographic sense, but they do
+# reveal who runs this stack. They live in the same encrypted vault as
+# credentials, so a reader of this repository cannot deduce the real site,
+# host, organisation or people. See ADR-026 in docs/DECISIONS.md.
+#
+# Confidential source values stay in group_vars/<env>/vault.yml. Shared aliases
+# below resolve each host's matching environment vault; they do not put those
+# values in a shared vault. Every required reference uses `mandatory` so a
+# missing vault key fails loudly instead of silently falling back.
+
+# --- secret indirection (templates use left side, vault provides right side) ---
+domain: "{{ vault_domain | mandatory }}"
+site_name: "{{ vault_site_name | mandatory }}"
+frappe_mail_server: "{{ vault_mail_server | mandatory }}"
+frappe_mail_login: "{{ vault_mail_login | mandatory }}"
+traefik_dashboard_host: "{{ vault_traefik_dashboard_host | mandatory }}"
+base_operators: "{{ vault_base_operators | mandatory }}"
+ci_deploy_authorized_keys: "{{ vault_ci_deploy_authorized_keys | mandatory }}"
+cf_token: "{{ vault_cf_token | default(vault_cf_dns_api_token | default('')) }}"
+crowdsec_key: "{{ vault_crowdsec_key | default('CHANGE_ME') }}"
+crowdsec_traefik_key: "{{ crowdsec_key }}"
+crowdsec_firewall_key: "{{ vault_crowdsec_firewall_key | default('CHANGE_ME') }}"
+cloudflare_email: "{{ vault_cloudflare_email | default('CHANGE_ME') }}"
+# Despite the `cloudflare` name, this is the Let's Encrypt account contact and
+# is required in every mode. See docs/roles/traefik.md.
+acme_server: "{{ cloudflare_acme_server }}"
+# Dashboard users: the vault holds a map of username -> bcrypt hash, rendered
+# to user:hash lines. There is deliberately no plaintext default here: the
+# vault is the only source, so an environment cannot silently ship the
+# previous roster.
+traefik_dashboard_users: >-
+  {{ vault_traefik_dashboard_users | default({}) | dict2items | map(attribute='key')
+     | zip(vault_traefik_dashboard_users | default({}) | dict2items | map(attribute='value'))
+     | map('join', ':') | join('\n') }}
+db_root_password: "{{ vault_db_root_password | default('CHANGE_ME') }}"
+db_encryption_key: "{{ vault_db_encryption_key | default('CHANGE_ME') }}"
+db_key_password: "{{ vault_db_key_password | default('CHANGE_ME') }}"
+admin_password: "{{ vault_admin_password | default('CHANGE_ME') }}"
+# Mail password for outgoing email (mounted as a secret into the configurator only)
+frappe_mail_password: "{{ vault_mail_password | default('CHANGE_ME_MAIL_PASSWORD') }}"
+# Telegram notifications
+crowdsec_telegram_bot_token: "{{ vault_telegram_bot_token | default('CHANGE_ME') }}"
+crowdsec_telegram_chat_id: "{{ vault_telegram_chat_id | default('CHANGE_ME') }}"

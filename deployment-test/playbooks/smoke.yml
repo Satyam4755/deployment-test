@@ -1,0 +1,22 @@
+---
+# Post-deployment verification. `ansible-playbook` exiting 0 means Ansible
+# completed its tasks, which is not the same as the site serving traffic — the
+# Frappe containers can be up while bench is failing to reach the database, and
+# the edge can be running while no certificate has been issued.
+#
+# Read-only: this playbook changes nothing. Safe to run against production at
+# any time, and used by the CI workflow after every apply.
+#
+#   ansible-playbook -i inventory/inventory.yml \
+#     --limit production -e target_env=production \
+#     --vault-id prod@/tmp/vault_pass playbooks/smoke.yml
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Verify the deployment
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the post-deployment checks
+      ansible.builtin.import_tasks: tasks/smoke.yml

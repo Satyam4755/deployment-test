@@ -1,0 +1,293 @@
+name: Deploy Application
+
+# SECURITY MODEL
+# - The pipeline holds exactly one SSH key (ci-deploy) and no passwords.
+# - It cannot read vault, cannot become root, cannot change infrastructure.
+# - It runs two root-owned scripts: erp-deploy and erp-smoke.
+# - Production requires approval from a designated reviewer (no self-review).
+# - Development runs first; a failed development smoke never creates a
+#   production job. A manual production dispatch is a re-deploy of a digest
+#   and still goes through the production environment's approval.
+# - A rollback is a deploy of an older digest. There is no separate job.
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: 'sha256 digest of the application image (e.g. sha256:a1b2c3...)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment for initial deploy'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - production
+
+permissions:
+  contents: read
+  # No secrets, no vault, no become password
+
+# Never let two deploys to the same environment run concurrently.
+concurrency:
+  group: deploy-app-${{ github.event.inputs.environment || github.event.client_payload.environment || 'development' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare & Validate
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.validate.outputs.digest }}
+      environment: ${{ steps.validate.outputs.environment }}
+      actor: ${{ steps.validate.outputs.actor }}
+    steps:
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+
+      - name: Validate dispatch payload
+        id: validate
+        env:
+          # Event payloads are untrusted input. Pass them as environment
+          # variables so the shell never parses their contents as code.
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_DIGEST: ${{ github.event.client_payload.digest }}
+          PAYLOAD_ENVIRONMENT: ${{ github.event.client_payload.environment }}
+          PAYLOAD_ACTOR: ${{ github.event.client_payload.actor }}
+          INPUT_DIGEST: ${{ github.event.inputs.digest }}
+          INPUT_ENVIRONMENT: ${{ github.event.inputs.environment }}
+          DEFAULT_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            DIGEST="$PAYLOAD_DIGEST"
+            ENV="${PAYLOAD_ENVIRONMENT:-development}"
+            ACTOR="${PAYLOAD_ACTOR:-$DEFAULT_ACTOR}"
+          else
+            DIGEST="$INPUT_DIGEST"
+            ENV="$INPUT_ENVIRONMENT"
+            ACTOR="$DEFAULT_ACTOR"
+          fi
+
+          # Validate digest format
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid digest format: $DIGEST (must be sha256:<64 hex chars>)"
+            exit 1
+          fi
+
+          if [[ ! "$ENV" =~ ^(development|production)$ ]]; then
+            echo "::error::Invalid environment: $ENV"
+            exit 1
+          fi
+
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+          echo "actor=$ACTOR" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deploy summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Digest | \`$DIGEST\` |"
+            echo "| Environment | \`$ENV\` |"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Actor | $ACTOR |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Validated: digest=$DIGEST environment=$ENV"
+
+  deploy-development:
+    name: Deploy Development
+    needs: prepare
+    if: needs.prepare.outputs.environment == 'development'
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+
+      - name: Resolve credentials from environment secrets
+        env:
+          CI_DEPLOY_SSH_KEY: ${{ secrets.CI_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          if [ -z "$CI_DEPLOY_SSH_KEY" ]; then
+            echo "::error::Secret CI_DEPLOY_SSH_KEY is not set on the 'development' environment."
+            exit 1
+          fi
+
+          # Mask before the values can ever reach the log.
+          while IFS= read -r line; do
+            [ -n "$line" ] && printf '::add-mask::%s\n' "$line"
+          done <<< "$CI_DEPLOY_SSH_KEY"
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # Validate the key parses without ever printing its contents.
+          ssh-keygen -lf ~/.ssh/id_deploy > /dev/null && echo "SSH key parsed OK"
+
+      - name: Verify non-secret runtime variables are present
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          set +x
+          for v in TARGET_SERVER_HOST CI_DEPLOY_USER SSH_PORT; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Variable $v is not set. Add it under Settings -> Environments -> development -> Variables."
+              exit 1
+            fi
+          done
+          echo "Runtime identity variables present (values not shown)"
+
+      - name: Deploy application image
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+          DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
+          DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          # The ci-deploy sudo rule preserves only these two metadata
+          # variables, which the host script writes to its audit log.
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $DIGEST"
+          ssh -o StrictHostKeyChecking=accept-new \
+            -i ~/.ssh/id_deploy \
+            -p "$SSH_PORT" \
+            "$CI_DEPLOY_USER@$TARGET_SERVER_HOST" \
+            "$REMOTE"
+
+      - name: Smoke test development
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          set +x
+          ssh -o StrictHostKeyChecking=accept-new \
+            -i ~/.ssh/id_deploy \
+            -p "$SSH_PORT" \
+            "$CI_DEPLOY_USER@$TARGET_SERVER_HOST" \
+            "sudo -n /usr/local/bin/erp-smoke"
+
+  deploy-production:
+    name: Deploy Production
+    needs: [prepare, deploy-development]
+    # Normal flow: development succeeded, so production runs and waits for
+    # approval. Manual flow: environment=production re-deploys a known digest
+    # and still waits for approval.
+    if: |
+      always() && (
+        needs.prepare.outputs.environment == 'production' ||
+        (needs.prepare.outputs.environment == 'development' && needs.deploy-development.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    environment: production
+    # Requires reviewer approval; self-review disabled in environment settings
+    steps:
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+
+      - name: Resolve credentials from environment secrets
+        env:
+          CI_DEPLOY_SSH_KEY: ${{ secrets.CI_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          if [ -z "$CI_DEPLOY_SSH_KEY" ]; then
+            echo "::error::Secret CI_DEPLOY_SSH_KEY is not set on the 'production' environment."
+            exit 1
+          fi
+
+          # Mask before the values can ever reach the log.
+          while IFS= read -r line; do
+            [ -n "$line" ] && printf '::add-mask::%s\n' "$line"
+          done <<< "$CI_DEPLOY_SSH_KEY"
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CI_DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # Validate the key parses without ever printing its contents.
+          ssh-keygen -lf ~/.ssh/id_deploy > /dev/null && echo "SSH key parsed OK"
+
+      - name: Verify non-secret runtime variables are present
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          set +x
+          for v in TARGET_SERVER_HOST CI_DEPLOY_USER SSH_PORT; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Variable $v is not set. Add it under Settings -> Environments -> production -> Variables."
+              exit 1
+            fi
+          done
+          echo "Runtime identity variables present (values not shown)"
+
+      - name: Deploy application image
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+          DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
+          DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          # The ci-deploy sudo rule preserves only these two metadata
+          # variables, which the host script writes to its audit log.
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $DIGEST"
+          ssh -o StrictHostKeyChecking=accept-new \
+            -i ~/.ssh/id_deploy \
+            -p "$SSH_PORT" \
+            "$CI_DEPLOY_USER@$TARGET_SERVER_HOST" \
+            "$REMOTE"
+
+      - name: Smoke test production
+        env:
+          TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
+          CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          set +x
+          ssh -o StrictHostKeyChecking=accept-new \
+            -i ~/.ssh/id_deploy \
+            -p "$SSH_PORT" \
+            "$CI_DEPLOY_USER@$TARGET_SERVER_HOST" \
+            "sudo -n /usr/local/bin/erp-smoke"
+
+  record:
+    name: Record release
+    needs: [prepare, deploy-production]
+    if: needs.deploy-production.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the deployed digest
+        run: |
+          {
+            echo "### Release deployed"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Digest | \`${{ needs.prepare.outputs.digest }}\` |"
+            echo "| Environment | \`${{ needs.prepare.outputs.environment }}\` |"
+            echo "| Actor | \`${{ needs.prepare.outputs.actor }}\` |"
+            echo "| Run | ${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

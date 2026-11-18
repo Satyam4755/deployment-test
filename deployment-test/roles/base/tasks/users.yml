@@ -1,0 +1,230 @@
+---
+# Establishes the two-layer access model that the whole repo assumes:
+#   layer 1  SSH as a per-person, key-only admin account
+#   layer 2  passworded sudo: root for system changes, `sudo -u deployowner`
+#            for stack work so files keep a single owner
+#
+# Admins are root-equivalent by design. The second layer is the admin's own
+# password, not a shared credential.
+#
+# The login users are deliberately never added to the `docker` group. Membership
+# in that group is equivalent to root: anyone holding the login key could
+# mount the host filesystem into a container and become root, which would make
+# the second layer decorative.
+#
+# Admin accounts are created from the `base_operators` list. That list, with the
+# account names and public keys, is held in the encrypted
+# `vault_base_operators` variable. Each admin's sudo password hash is looked up
+# by name in `vault_operator_password_hashes`. Offboarding is automatic: an
+# admin removed from the vault list has their account removed on the next run.
+#
+# The `ci-deploy` account is created separately (in ci_deploy.yml) and added to
+# AllowUsers once the pipeline is registered.
+
+- name: Assert the access model is fully specified
+  # Fail before touching anything. Creating a login user with no key, or a
+  # sudo rule with no password, silently produces a host that cannot be
+  # managed or (worse) one that is wide open.
+  #
+  # The placeholder check matters here too: the vault templates ship
+  # CHANGE_ME_* values that are non-empty, so a length check alone would
+  # install a placeholder hash as a real password.
+  ansible.builtin.assert:
+    that:
+      - base_deploy_owner_user | length > 0
+      - base_operators | length > 0
+      # Each entry must define name and keys. `rejectattr` with the
+      # `undefined` test is the existence check; `all(...)` is not a filter,
+      # so the older form failed before any account was created.
+      - base_operators | rejectattr('name', 'undefined') | list | length == base_operators | length
+      - base_operators | rejectattr('keys', 'undefined') | list | length == base_operators | length
+      - base_operators | map(attribute='keys') | map('length') | select('gt', 0) | list | length == base_operators | length
+      # Every admin must have a yescrypt hash, and it must not be a placeholder.
+      - base_operators | map(attribute='name') | difference(vault_operator_password_hashes | default({}) | list) | list | length == 0
+      - vault_operator_password_hashes | default({}) | dict2items
+        | selectattr('value', 'match', '^CHANGE_ME') | list | length == 0
+      # Placeholder keys are non-empty and start with `ssh-`, so they would
+      # pass an existence check while granting access to nobody. Reject them
+      # explicitly; otherwise the role would disable password authentication
+      # on a host where no real key is installed.
+      - base_operators | map(attribute='keys') | flatten | select('search', 'CHANGE_ME') | list | length == 0
+      - base_operators | map(attribute='keys') | flatten | select('search', '^ssh-') | list | length
+        == base_operators | map(attribute='keys') | flatten | list | length
+    fail_msg: >-
+      Refusing to touch host access. Define vault_base_operators in
+      group_vars/{{ env_name }}/vault.yml with name and keys (list) for each
+      admin, define vault_operator_password_hashes in the same vault, and
+      export DEPLOY_OWNER_USER.
+    quiet: true
+  tags: [base, users]
+
+- name: Create the operators group
+  ansible.builtin.group:
+    name: "{{ base_operator_group }}"
+    state: present
+  tags: [base, users]
+
+- name: Create the privileged deploy owner
+  ansible.builtin.user:
+    name: "{{ base_deploy_owner_user }}"
+    # No password at all. SSH password login is disabled by ssh.yml, and sudo
+    # authenticates the admin who invoked it, not the target account. A shared
+    # owner password would be a credential the design explicitly removes.
+    shell: /bin/bash
+    # Supplementary groups are managed by roles/docker, which adds the owner
+    # after the docker group exists. Setting `groups` here would fail on a
+    # fresh host, because that group is created when the package is installed.
+    create_home: true
+    home: "/home/{{ base_deploy_owner_user }}"
+    state: present
+  no_log: true
+  tags: [base, users]
+
+- name: Lock the deploy owner's password
+  # The deployowner is a service identity: no SSH login, no usable password.
+  # It owns the stack directories and is the only account in the docker group.
+  ansible.builtin.user:
+    name: "{{ base_deploy_owner_user }}"
+    password_lock: true
+  tags: [base, users]
+
+- name: Create per-person admin accounts
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    shell: /bin/bash
+    groups: ["{{ base_operator_group }}"]
+    append: false
+    create_home: true
+    home: "/home/{{ item.name }}"
+    state: present
+    # Use update_password: on_create so a later passwd change is not overwritten
+    update_password: on_create
+    password: "{{ vault_operator_password_hashes[item.name] }}"
+  loop: "{{ base_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [base, users]
+
+- name: Ensure admin accounts' ssh directories exist
+  ansible.builtin.file:
+    path: "/home/{{ item.name }}/.ssh"
+    state: directory
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: '0700'
+  loop: "{{ base_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [base, users]
+
+- name: Install admin accounts' authorized keys
+  # `exclusive: yes` replaces the file wholesale, so keys removed from the
+  # variable are actually revoked. keyscan-style append is not used.
+  ansible.builtin.copy:
+    dest: "/home/{{ item.name }}/.ssh/authorized_keys"
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: '0600'
+    content: |
+      # Managed by Ansible (roles/base). Edits are overwritten.
+      {% for key in item["keys"] %}
+      {{ key }}
+      {% endfor %}
+  notify: Verify SSH access
+  loop: "{{ base_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [base, users]
+
+- name: Read the current members of the operators group
+  # Offboarding is derived from the host, not from a variable that somebody
+  # has to remember to maintain: anyone in the group who is absent from
+  # base_operators is an admin who has been removed from the list.
+  ansible.builtin.getent:
+    database: group
+    key: "{{ base_operator_group }}"
+  register: base_operator_group_entry
+  tags: [base, users]
+
+- name: Remove admin accounts no longer in base_operators
+  # Offboarding is real: an admin removed from the list is removed on the
+  # next run, and their home directory and keys go with the account. This
+  # prevents credential drift.
+  ansible.builtin.user:
+    name: "{{ item }}"
+    state: absent
+    remove: true
+  loop: >-
+    {{ (base_operator_group_entry.ansible_facts.getent_group[base_operator_group][2] | default('', true)).split(',')
+       | select('ne', '')
+       | reject('in', base_operators | map(attribute='name') | list)
+       | list }}
+  loop_control:
+    label: "{{ item }}"
+  tags: [base, users]
+
+- name: Allow operators full sudo
+  # Admins are root-equivalent by design (ARCHITECTURE.md). The rule is
+  # passworded: sudo authenticates the admin's own password, which is why
+  # admin accounts must keep a usable password even though SSH is key-only.
+  # `sudo -u deployowner` remains the normal target for stack work so files
+  # keep one owner; ordinary sudo is for package and system changes.
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/base-operators
+    mode: '0440'
+    content: |
+      # Managed by Ansible (roles/base).
+      # Full sudo for named admins. Passworded: the login key alone is not
+      # enough to own the host.
+      Defaults:{{ base_operator_group }} env_keep += "DEPLOY_OWNER_USER"
+      %{{ base_operator_group }} ALL=(ALL:ALL) ALL
+    # A malformed sudoers file makes sudo unusable for everyone, including
+    # the escalation path this file exists to provide.
+    validate: /usr/sbin/visudo -cf %s
+  notify: Reload sudo
+  tags: [base, users]
+
+- name: Remove the legacy sudoers drop-in
+  # Older runs of this role wrote /etc/sudoers.d/deploy. Leaving it behind
+  # duplicates the grant under a name the documentation does not mention.
+  ansible.builtin.file:
+    path: /etc/sudoers.d/deploy
+    state: absent
+  tags: [base, users]
+
+- name: Remove any other passworded sudo grants to operators
+  # The copy above replaces /etc/sudoers.d/base-operators, but a previous manual edit
+  # elsewhere in sudoers could still grant the operators broader access.
+  # Report rather than silently rewrite, so a human reviews.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      grep -rEn '^%?{{ base_operator_group | regex_escape }}\b'
+      /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+      | grep -v '/etc/sudoers.d/base-operators:'
+      | grep -v 'Defaults:'
+  register: base_extra_sudo
+  changed_when: false
+  failed_when: false
+  tags: [base, users]
+
+- name: Warn about unexpected sudo grants for operators group
+  ansible.builtin.debug:
+    msg: >-
+      Review these sudo references for {{ base_operator_group }} outside the
+      managed file — they may grant more than intended:
+      {{ base_extra_sudo.stdout_lines | default([]) }}
+  when: base_extra_sudo.stdout | default('') | length > 0
+  tags: [base, users]
+
+- name: Write the AllowUsers list from the access model
+  # Only admin accounts, plus ci-deploy once a real pipeline key exists. The
+  # deploy owner is a sudo target and must never be able to log in.
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^AllowUsers'
+    line: "AllowUsers {{ base_allowed_ssh_users | join(' ') }}"
+    state: present
+    validate: 'sshd -t -f %s'
+  notify: Restart sshd
+  tags: [base, users, ssh]

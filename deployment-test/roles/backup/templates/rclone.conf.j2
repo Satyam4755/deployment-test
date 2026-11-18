@@ -1,0 +1,12 @@
+[{{ backup_remote_name }}]
+type = s3
+provider = Other
+env_auth = false
+access_key_id = {{ backup_access_key_id }}
+secret_access_key = {{ backup_secret_access_key }}
+{% if backup_endpoint %}
+endpoint = {{ backup_endpoint }}
+{% endif %}
+region = {{ backup_region }}
+acl = private
+storage_class = {{ backup_storage_class }}

@@ -1,0 +1,540 @@
+---
+- name: Fail if placeholder crowdsec secrets are used
+  # A missing vault key counts as a placeholder, so we fail with a clear
+  # message rather than an undefined-variable error.
+  #
+  # Required: Traefik bouncer key, firewall bouncer key, Telegram credentials.
+  # ACME email is a Traefik input, not a CrowdSec one, so it is not checked
+  # here.
+  ansible.builtin.fail:
+    msg: >-
+      Deployment aborted: set real vault values for {{ env_name | default('this env') }}
+      (vault_crowdsec_key, vault_crowdsec_firewall_key, vault_telegram_bot_token,
+       vault_telegram_chat_id).
+  when:
+    - >-
+      crowdsec_traefik_key | default('', true) | length == 0 or
+      crowdsec_traefik_key | default('', true) is match('^CHANGE_ME') or
+      (
+        (crowdsec_firewall_bouncer_enabled | default(true)) and
+        (
+          crowdsec_firewall_key | default('', true) | length == 0 or
+          crowdsec_firewall_key | default('', true) is match('^CHANGE_ME')
+        )
+      ) or
+      (
+        (crowdsec_telegram_enabled | default(true)) and
+        (
+          crowdsec_telegram_bot_token | default('', true) | length == 0 or
+          crowdsec_telegram_bot_token | default('', true) is match('^CHANGE_ME') or
+          crowdsec_telegram_chat_id | default('', true) | length == 0 or
+          crowdsec_telegram_chat_id | default('', true) is match('^CHANGE_ME')
+        )
+      )
+  no_log: true
+
+- name: Create crowdsec directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/crowdsec"
+    state: directory
+    mode: '0750'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create the crowdsec acquisition directory
+  # CrowdSec reads one file per log source from /etc/crowdsec/acquis.d/.
+  ansible.builtin.file:
+    path: "{{ base_dir }}/crowdsec/acquis.d"
+    state: directory
+    mode: '0750'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template the crowdsec acquisition for the Traefik access log
+  # This one small file is what makes the whole detection chain work. Without
+  # it CrowdSec starts happily, reads no logs, produces no decisions, and the
+  # bouncer blocks nobody.
+  ansible.builtin.template:
+    src: acquis.d/traefik.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/acquis.d/traefik.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template the crowdsec acquisition for SSH auth log
+  # Reads /logs/auth.log (host /var/log/auth.log mounted read-only) with the
+  # sshd parser. Enables SSH brute-force detection.
+  ansible.builtin.template:
+    src: acquis.d/sshd.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/acquis.d/sshd.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template the crowdsec acquisition for AppSec listener
+  # Starts the AppSec listener on 0.0.0.0:7422 inside the container.
+  # The acquisition type 'appsec' feeds AppSec events into the LAPI.
+  ansible.builtin.template:
+    src: acquis.d/appsec.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/acquis.d/appsec.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  when: crowdsec_appsec_enabled | default(true)
+
+- name: Remove the AppSec acquisition when AppSec is disabled
+  # Without this, a file left by an earlier run keeps the listener open even
+  # though the flag says it is off.
+  ansible.builtin.file:
+    path: "{{ base_dir }}/crowdsec/acquis.d/appsec.yaml"
+    state: absent
+  when: not (crowdsec_appsec_enabled | default(true))
+
+- name: Template an empty crowdsec acquisition file
+  # This replaces the nginx and syslog sources the image ships with. Those
+  # files do not exist here, so without this CrowdSec logs a "datasource
+  # unavailable" error for every one of them.
+  ansible.builtin.template:
+    src: acquis.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/acquis.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template crowdsec secrets env file
+  ansible.builtin.template:
+    src: crowdsec.env.j2
+    dest: "{{ base_dir }}/crowdsec/.env"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+
+- name: Template crowdsec profiles configuration
+  # Defines remediation policy and notification wiring.
+  ansible.builtin.template:
+    src: profiles.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/profiles.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template crowdsec telegram notification
+  # Mode 0600 root: the container runs as root, and the bot token is part of the
+  # Telegram API URL, so it must not appear in shell history, commits or logs.
+  ansible.builtin.template:
+    src: telegram.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/telegram.yaml"
+    mode: '0600'
+    owner: root
+    group: root
+  no_log: true
+  when: crowdsec_telegram_enabled | default(true)
+
+- name: Remove the Telegram notification when Telegram is disabled
+  ansible.builtin.file:
+    path: "{{ base_dir }}/crowdsec/telegram.yaml"
+    state: absent
+  when: not (crowdsec_telegram_enabled | default(true))
+
+- name: Template crowdsec compose (canonical compose.yaml)
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ base_dir }}/crowdsec/compose.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Start crowdsec
+  community.docker.docker_compose_v2:
+    project_src: "{{ base_dir }}/crowdsec"
+    state: present
+    pull: always
+  when: not ansible_check_mode
+
+- name: Ensure CrowdSec local API credentials target 127.0.0.1
+  # Ensures that even if the named volume /etc/crowdsec was previously initialized
+  # with http://0.0.0.0:8080, the client credentials file uses 127.0.0.1:8080 so
+  # cscli lapi status succeeds idempotently without deleting persistent volume data.
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      sh -c "if [ -f /etc/crowdsec/local_api_credentials.yaml ]; then
+        sed -i 's|http://0\.0\.0\.0:8080|http://127.0.0.1:8080|g' /etc/crowdsec/local_api_credentials.yaml;
+      fi"
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+# ---------------------------------------------------------------------------
+# Bouncer registration
+#
+# The LAPI keys come from the vault and are therefore authoritative, which is
+# the right way round for Ansible: the value is version-controlled (encrypted)
+# rather than discovered on a host, so re-running the role converges instead
+# of generating a new key every time.
+# ---------------------------------------------------------------------------
+- name: Wait for the CrowdSec LAPI to become ready
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: cscli lapi status
+  register: crowdsec_ready
+  until: (crowdsec_ready.rc | default(1) | int) == 0
+  retries: 20
+  delay: 5
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: List the existing LAPI bouncers
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: cscli bouncers list -o json
+  register: crowdsec_bouncers
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Register the Traefik bouncer if it is absent
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      cscli bouncers add traefik
+      --key {{ crowdsec_traefik_key }}
+  register: crowdsec_bouncer_add
+  changed_when: crowdsec_bouncer_add.rc == 0
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_bouncers is not failed
+    - "'\"traefik\"' not in (crowdsec_bouncers.stdout | default(''))"
+
+- name: Check that the vault key works with the registered Traefik bouncer
+  # `cscli bouncers list` never prints the key itself, so the only honest way
+  # to know whether the registered bouncer still matches the vault is to use
+  # the key and see whether the LAPI accepts it. Without this check a rotated
+  # vault key would leave Traefik presenting a key the LAPI rejects, and the
+  # bouncer would stop receiving decisions.
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      wget --quiet --tries=1 --output-document=/dev/null
+      --header="X-Api-Key: {{ crowdsec_traefik_key }}"
+      http://127.0.0.1:8080/v1/decisions
+  register: crowdsec_key_check
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_bouncers is not failed
+
+- name: Re-register the Traefik bouncer when the vault key no longer matches
+  # The vault is the source of truth. If the registered key is not the vault
+  # key, the bouncer is replaced so that a rotated value takes effect.
+  when:
+    - not ansible_check_mode
+    - crowdsec_bouncers is not failed
+    - crowdsec_key_check.rc | default(1) != 0
+  no_log: true
+  block:
+    - name: Delete the stale Traefik bouncer
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: cscli bouncers delete traefik
+      no_log: true
+
+    - name: Re-register the Traefik bouncer with the current key
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: >-
+          cscli bouncers add traefik
+          --key {{ crowdsec_traefik_key }}
+          --description "Traefik {{ env_name }} edge bouncer"
+      no_log: true
+
+- name: Check the Traefik bouncer key again after re-registering
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      wget --quiet --tries=1 --output-document=/dev/null
+      --header="X-Api-Key: {{ crowdsec_traefik_key }}"
+      http://127.0.0.1:8080/v1/decisions
+  register: crowdsec_key_recheck
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_bouncers is not failed
+
+- name: Fail if the Traefik bouncer key is still not accepted
+  ansible.builtin.fail:
+    msg: >-
+      The LAPI rejected the Traefik bouncer key from the vault for {{ env_name | default('this env') }}.
+      Traefik would present a key the LAPI refuses, so no decisions would ever
+      reach the edge. Check the vault value and the bouncer registration.
+  when:
+    - not ansible_check_mode
+    - crowdsec_bouncers is not failed
+    - crowdsec_key_recheck.rc | default(1) != 0
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# Host firewall bouncer (firewall-host)
+# ---------------------------------------------------------------------------
+- name: Register the host firewall bouncer if it is absent
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      cscli bouncers add firewall-host
+      --key {{ crowdsec_firewall_key }}
+  register: crowdsec_firewall_bouncer_add
+  changed_when: true
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+    - crowdsec_bouncers is not failed
+    - "'\"firewall-host\"' not in (crowdsec_bouncers.stdout | default(''))"
+
+- name: Check that the firewall bouncer vault key works
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      wget --quiet --tries=1 --output-document=/dev/null
+      --header="X-Api-Key: {{ crowdsec_firewall_key }}"
+      http://127.0.0.1:8080/v1/decisions
+  register: crowdsec_firewall_key_check
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+    - crowdsec_bouncers is not failed
+
+- name: Re-register the firewall bouncer when the vault key no longer matches
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+    - crowdsec_bouncers is not failed
+    - crowdsec_firewall_key_check.rc | default(1) != 0
+  no_log: true
+  block:
+    - name: Delete the stale firewall-host bouncer
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: cscli bouncers delete firewall-host
+      no_log: true
+
+    - name: Re-register the firewall-host bouncer with the current key
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: >-
+          cscli bouncers add firewall-host
+          --key {{ crowdsec_firewall_key }}
+          --description "Host firewall {{ env_name }} nftables bouncer"
+      no_log: true
+
+- name: Check the firewall bouncer key again after re-registering
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: >-
+      wget --quiet --tries=1 --output-document=/dev/null
+      --header="X-Api-Key: {{ crowdsec_firewall_key }}"
+      http://127.0.0.1:8080/v1/decisions
+  register: crowdsec_firewall_key_recheck
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+    - crowdsec_bouncers is not failed
+
+- name: Stop and disable host firewall bouncer when disabled
+  ansible.builtin.systemd:
+    name: crowdsec-firewall-bouncer
+    state: stopped
+    enabled: false
+  failed_when: false
+  become: true
+  when:
+    - not ansible_check_mode
+    - not (crowdsec_firewall_bouncer_enabled | default(true))
+
+- name: Purge host firewall bouncer package if present or broken when disabled
+  ansible.builtin.apt:
+    name: crowdsec-firewall-bouncer-nftables
+    state: absent
+    purge: true
+  failed_when: false
+  become: true
+  when:
+    - not ansible_check_mode
+    - not (crowdsec_firewall_bouncer_enabled | default(true))
+
+- name: Install and configure host firewall bouncer
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+  block:
+    - name: Ensure the CrowdSec apt keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Install the CrowdSec packagecloud signing key
+      ansible.builtin.get_url:
+        url: https://packagecloud.io/crowdsec/crowdsec/gpgkey
+        dest: /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.asc
+        mode: '0644'
+      become: true
+
+    - name: Dearmor the CrowdSec signing key
+      ansible.builtin.command:
+        cmd: >-
+          gpg --dearmor --yes
+          --output /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+          /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.asc
+        creates: /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+      become: true
+
+    - name: Add the CrowdSec packagecloud repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/crowdsec.list
+        mode: '0644'
+        content: |
+          deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any/ any main
+      become: true
+
+    - name: Ensure CrowdSec bouncer configuration directory exists
+      ansible.builtin.file:
+        path: /etc/crowdsec/bouncers
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      become: true
+
+    - name: Pre-write host firewall bouncer configuration
+      # Pre-writing the configuration with the registered API key prevents postinst failure
+      ansible.builtin.template:
+        src: crowdsec-firewall-bouncer.yaml.j2
+        dest: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+        mode: '0600'
+        owner: root
+        group: root
+      no_log: true
+      become: true
+
+    - name: Prevent service startup during package installation
+      ansible.builtin.copy:
+        dest: /usr/sbin/policy-rc.d
+        content: |
+          #!/bin/sh
+          exit 101
+        mode: '0755'
+        owner: root
+        group: root
+      become: true
+
+    - name: Install crowdsec-firewall-bouncer-nftables package
+      ansible.builtin.apt:
+        name: crowdsec-firewall-bouncer-nftables
+        state: present
+        update_cache: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      become: true
+
+    - name: Restore policy-rc.d
+      ansible.builtin.file:
+        path: /usr/sbin/policy-rc.d
+        state: absent
+      become: true
+
+    - name: List bouncers registered by the package
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: cscli bouncers list -o json
+      register: crowdsec_bouncers_after_install
+      changed_when: false
+      failed_when: false
+
+    - name: Remove any auto-registered bouncer
+      community.docker.docker_container_exec:
+        container: crowdsec
+        command: "cscli bouncers delete {{ item }}"
+      loop: >-
+        {{ ((crowdsec_bouncers_after_install.stdout | default('[]', true) | from_json)
+            | map(attribute='name')
+            | reject('in', ['traefik', 'firewall-host'])
+            | list)
+           if (crowdsec_bouncers_after_install.stdout | default('') | trim).startswith('[')
+           else [] }}
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+    - name: Start and enable host firewall bouncer service
+      ansible.builtin.systemd:
+        name: crowdsec-firewall-bouncer
+        state: started
+        enabled: true
+        daemon_reload: true
+      become: true
+
+- name: Confirm the LAPI is reachable from the Traefik network
+  # The gate for enabling the bouncer in group_vars/<env>/main.yml.
+  #
+  # Run from inside the *traefik* container, not crowdsec: that is the vantage
+  # point that matters, because the bouncer plugin dials the LAPI from there.
+  # Checking from crowdsec would only prove crowdsec can reach itself over its
+  # own network, which says nothing about whether Traefik will.
+  community.docker.docker_container_exec:
+    container: traefik
+    command: wget --no-verbose --tries=1 --spider http://crowdsec:8080/health
+  register: crowdsec_lapi_reachable
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Check host firewall bouncer service status
+  # `systemd` cannot query state without changing it, so the is-active probe
+  # is a deliberate command; its exit code feeds the report below.
+  ansible.builtin.command:
+    cmd: systemctl is-active crowdsec-firewall-bouncer  # noqa: command-instead-of-module
+  register: crowdsec_firewall_bouncer_active
+  changed_when: false
+  failed_when: false
+  when:
+    - not ansible_check_mode
+    - crowdsec_firewall_bouncer_enabled | default(true)
+
+- name: Report whether the bouncers can now be enabled
+  ansible.builtin.debug:
+    msg:
+      - >-
+        LAPI reachable from traefik at http://crowdsec:8080:
+        {{ 'yes' if (crowdsec_lapi_reachable.rc | default(1)) == 0
+           else 'NO - verify traefik and crowdsec share the crowdsec-net network' }}
+      - >-
+        Bouncer `traefik` registered with the vault key:
+        {{ 'yes' if (crowdsec_key_recheck.rc | default(1)) == 0
+           else 'NO - the LAPI rejected the key' }}
+      - >-
+        Bouncer `firewall-host` registered with the vault key:
+        {{ 'disabled (development)' if not (crowdsec_firewall_bouncer_enabled | default(true))
+           else ('yes' if (crowdsec_firewall_key_recheck.rc | default(1)) == 0 else 'NO - the LAPI rejected the key') }}
+      - >-
+        Host firewall bouncer service active:
+        {{ 'disabled (development)' if not (crowdsec_firewall_bouncer_enabled | default(true))
+           else ('yes' if (crowdsec_firewall_bouncer_active.rc | default(1)) == 0 else 'NO - check systemctl status crowdsec-firewall-bouncer') }}
+      - >-
+        To enforce decisions at the edge, set traefik_crowdsec_enabled: true in
+        group_vars/{{ env_name | default('your-env') }}/main.yml, then run
+        playbooks/site.yml so the plugin is loaded and the app router picks it up.
+  when: not ansible_check_mode

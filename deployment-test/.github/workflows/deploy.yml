@@ -1,0 +1,103 @@
+name: Lint Infrastructure
+
+# SECURITY MODEL / ADR-001
+# Infrastructure playbooks need a vault password and a sudo password, so they
+# never run in CI. This workflow only lints the repository. Applying a change
+# is a control-machine action:
+#
+#   dev:  ansible-playbook -i inventory/inventory.yml \
+#           --limit development -e target_env=development \
+#           --vault-id dev@/tmp/vault_pass \
+#           --become-password-file /tmp/become_pass \
+#           --private-key ~/.ssh/id_ed25519 playbooks/site.yml --check --diff
+#
+#   prod: ansible-playbook -i inventory/inventory.yml \
+#           --limit production -e target_env=production \
+#           --vault-id prod@/tmp/vault_pass \
+#           --become-password-file /tmp/become_pass \
+#           --private-key ~/.ssh/id_ed25519 playbooks/site.yml --check --diff
+#
+# Drop --check --diff to apply. See docs/RUNBOOK.md.
+
+on:
+  push:
+    paths:
+      - 'playbooks/**'
+      - 'roles/**'
+      - 'group_vars/**'
+      - 'examples/**'
+      - 'inventory/**'
+      - 'scripts/**'
+      - 'requirements.yml'
+      - 'ansible.cfg'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    paths:
+      - 'playbooks/**'
+      - 'roles/**'
+      - 'group_vars/**'
+      - 'examples/**'
+      - 'inventory/**'
+      - 'scripts/**'
+      - 'requirements.yml'
+      - 'ansible.cfg'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check docs for version pins
+        run: bash scripts/check-docs-versions.sh
+
+      - name: Check for sensitive identifiers
+        # Structural checks always run. The optional value check reads
+        # SENSITIVE_PATTERNS from a repository secret, so the denylist itself
+        # is never published. See ADR-026.
+        env:
+          SENSITIVE_PATTERNS: ${{ secrets.SENSITIVE_PATTERNS }}
+        run: bash scripts/check-sensitive.sh
+
+      - name: Prepare vault fixtures
+        # ADR-026: no plaintext vault is tracked and CI holds no vault
+        # password. Replace both environment vaults with the tracked example
+        # fixtures inside the ephemeral runner only, so `ansible-lint` and
+        # `--syntax-check` can resolve every variable. The real vaults are
+        # never decrypted here.
+        run: |
+          set -euo pipefail
+          cp examples/vault.development.yml group_vars/development/vault.yml
+          cp examples/vault.production.yml group_vars/production/vault.yml
+
+      - name: Install ansible-core and lint tooling
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet ansible-core ansible-lint yamllint
+          ansible --version | head -1
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: ansible-lint
+        run: ansible-lint --profile production
+
+      - name: Syntax-check every playbook
+        # Both vaults are example fixtures at this point, so the check needs no
+        # vault password. --limit development still keeps the guard honest:
+        # it exercises the same single-environment path an operator uses.
+        run: |
+          set -euo pipefail
+          for p in playbooks/*.yml; do
+            echo "--- $p"
+            ansible-playbook --syntax-check \
+              -i inventory/inventory.yml \
+              --limit development \
+              -e target_env=development "$p"
+          done

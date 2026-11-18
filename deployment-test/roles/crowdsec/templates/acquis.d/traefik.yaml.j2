@@ -1,0 +1,11 @@
+# CrowdSec acquisition for Traefik's access log.
+#
+# Without this file CrowdSec has nothing to read. It would start cleanly,
+# parse no logs, produce no decisions, and the bouncer would silently block
+# nobody.
+#
+# `type: traefik` is what selects the crowdsecurity/traefik-logs parser.
+filenames:
+  - /var/log/traefik/access.log
+labels:
+  type: traefik

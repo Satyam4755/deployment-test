@@ -1,0 +1,374 @@
+---
+- name: Fail if placeholder application secrets are used
+  # A missing vault key counts as a placeholder, so we fail with a clear
+  # message rather than an undefined-variable error. The mail password is only
+  # required when outgoing mail is enabled.
+  ansible.builtin.fail:
+    msg: >-
+      Deployment aborted: set real vault values for {{ env_name | default('this env') }}
+      (vault_db_root_password, vault_admin_password, and vault_mail_password when
+      frappe_email_enabled is true).
+  when:
+    - db_root_password | default('', true) | length == 0 or
+      db_root_password | default('', true) is match('^CHANGE_ME') or
+      admin_password | default('', true) | length == 0 or
+      admin_password | default('', true) is match('^CHANGE_ME') or
+      (frappe_email_enabled | bool and
+       (frappe_mail_password | default('', true) | length == 0 or
+        frappe_mail_password | default('', true) is match('^CHANGE_ME')))
+
+- name: Fail if outgoing mail is enabled but incomplete
+  # Fail before the one-shot configurator creates the site, not after it has
+  # half-configured one. Exactly one of SSL and STARTTLS must be selected.
+  ansible.builtin.assert:
+    that:
+      - frappe_mail_server | default('', true) | length > 0
+      - frappe_mail_server | default('', true) is not match('^CHANGE_ME')
+      - frappe_mail_login | default('', true) | length > 0
+      - frappe_mail_login | default('', true) is not match('^CHANGE_ME')
+      - (frappe_mail_use_ssl | bool) != (frappe_mail_use_tls | bool)
+    fail_msg: >-
+      frappe_email_enabled is true. Set vault_mail_server and vault_mail_login
+      in group_vars/{{ env_name }}/vault.yml, set frappe_mail_port in
+      group_vars/{{ env_name }}/main.yml, keep vault_mail_password, and enable
+      exactly one of frappe_mail_use_ssl or frappe_mail_use_tls.
+    quiet: true
+  when: frappe_email_enabled | bool
+
+- name: Create erp directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/erp"
+    state: directory
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create erp secrets directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/erp/secrets"
+    state: directory
+    mode: '0700'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Write mail password secret
+  # Mounted only into the configurator while outgoing mail is enabled; never in
+  # environment or .env.
+  ansible.builtin.template:
+    src: mail_password.j2
+    dest: "{{ base_dir }}/erp/secrets/mail_password"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+  when: frappe_email_enabled | bool
+
+
+- name: Allow Frappe to traverse deployment directory
+  ansible.posix.acl:
+    path: "{{ base_dir }}"
+    entity: "1000"
+    etype: user
+    permissions: x
+    state: present
+
+- name: Allow Frappe to access ERP secrets directory
+  ansible.posix.acl:
+    path: "{{ base_dir }}/erp/secrets"
+    entity: "1000"
+    etype: user
+    permissions: x
+    state: present
+  when: frappe_email_enabled | bool
+
+- name: Allow Frappe to read mail password
+  ansible.posix.acl:
+    path: "{{ base_dir }}/erp/secrets/mail_password"
+    entity: "1000"
+    etype: user
+    permissions: r
+    state: present
+  when: frappe_email_enabled | bool
+  no_log: true
+
+- name: Template the initial site-config wrapper
+  # Creates the site through the image's init-site.sh and then fills the
+  # site-config keys this deployment owns, without overwriting later edits.
+  ansible.builtin.template:
+    src: configure-site.sh.j2
+    dest: "{{ base_dir }}/erp/configure-site.sh"
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create /etc/erp directory for deploy config
+  ansible.builtin.file:
+    path: /etc/erp
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Template erp deploy config
+  # Rendered once at provisioning; not updated on subsequent deploys.
+  ansible.builtin.template:
+    src: deploy.conf.j2
+    dest: /etc/erp/deploy.conf
+    mode: '0600'
+    owner: root
+    group: root
+
+- name: Install erp-deploy script
+  # Root-owned, only writable by root. Runs as root via ci-deploy sudo.
+  ansible.builtin.template:
+    src: erp-deploy.j2
+    dest: /usr/local/bin/erp-deploy
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Install erp-smoke script
+  ansible.builtin.template:
+    src: erp-smoke.j2
+    dest: /usr/local/bin/erp-smoke
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Ensure deploy log exists
+  ansible.builtin.file:
+    path: /var/log/erp-deploys.log
+    state: touch
+    mode: '0600'
+    owner: root
+    group: root
+    access_time: preserve
+    modification_time: preserve
+
+- name: Check if .env already exists
+  ansible.builtin.stat:
+    path: "{{ base_dir }}/erp/.env"
+  register: erp_env_stat
+  tags: [erp, secrets]
+
+- name: Template erp secrets env file
+  # Rendered only when the file is absent (provisioning) or when explicitly
+  # requested via erp_render_secrets=true. Normal deploys do not rewrite it.
+  ansible.builtin.template:
+    src: erp.env.j2
+    dest: "{{ base_dir }}/erp/.env"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+  when: not erp_env_stat.stat.exists or erp_render_secrets | default(false)
+
+- name: Template erp compose (canonical compose.yaml)
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ base_dir }}/erp/compose.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+# ---------------------------------------------------------------------------
+# Storage Preflight & Docker Housekeeping
+# ---------------------------------------------------------------------------
+- name: Remove stopped Docker containers before image pull
+  ansible.builtin.command:
+    cmd: docker container prune --force
+  register: erp_container_prune_result
+  changed_when: "'Total reclaimed space: 0B' not in (erp_container_prune_result.stdout | default(''))"
+  failed_when: false
+  when:
+    - erp_cleanup_docker | default(true) | bool
+    - not ansible_check_mode
+  tags: [erp, erp-cleanup]
+
+- name: Remove dangling Docker images before image pull
+  ansible.builtin.command:
+    cmd: docker image prune --force
+  register: erp_dangling_prune_result
+  changed_when: "'Total reclaimed space: 0B' not in (erp_dangling_prune_result.stdout | default(''))"
+  failed_when: false
+  when:
+    - erp_cleanup_docker | default(true) | bool
+    - not ansible_check_mode
+  tags: [erp, erp-cleanup]
+
+- name: Remove unused Docker images older than retention window (preserving ERP image)
+  ansible.builtin.shell:
+    cmd: >-
+      set -eo pipefail;
+      TARGET_ID="$(docker image inspect --format '{% raw %}{{.Id}}{% endraw %}' '{{ erp_image }}' 2>/dev/null || true)";
+      if [ -z "$TARGET_ID" ]; then
+        docker image prune --all --force --filter "until={{ erp_prune_images_until | default('24h') }}";
+      else
+        CANDIDATES="$(docker images --filter 'dangling=false' --filter "until={{ erp_prune_images_until | default('24h') }}" --format '{% raw %}{{.ID}}{% endraw %}' | grep -v "^${TARGET_ID:0:12}" || true)";
+        if [ -n "$CANDIDATES" ]; then
+          echo "$CANDIDATES" | xargs -r docker rmi 2>/dev/null || true;
+        fi
+      fi
+  register: erp_image_prune_result
+  changed_when: "'Total reclaimed space: 0B' not in (erp_image_prune_result.stdout | default(''))"
+  failed_when: false
+  when:
+    - erp_cleanup_docker | default(true) | bool
+    - not ansible_check_mode
+  tags: [erp, erp-cleanup]
+
+- name: Remove Docker BuildKit build cache
+  ansible.builtin.command:
+    cmd: >-
+      docker builder prune --force --all
+      --filter "until={{ erp_prune_builder_until | default('24h') }}"
+  register: erp_builder_prune_result
+  changed_when: "'Total reclaimed space: 0B' not in (erp_builder_prune_result.stdout | default(''))"
+  failed_when: false
+  when:
+    - erp_cleanup_docker | default(true) | bool
+    - not ansible_check_mode
+  tags: [erp, erp-cleanup]
+
+- name: Inspect disk space and inodes on Docker storage filesystem
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import os, json; docker_root = '/var/lib/docker' if os.path.exists('/var/lib/docker') else '/'; st = os.statvfs(docker_root); print(json.dumps({'docker_root': docker_root, 'free_gb': round((st.f_bavail * st.f_frsize) / (1024**3), 2), 'total_gb': round((st.f_blocks * st.f_frsize) / (1024**3), 2), 'free_inodes': st.f_favail, 'total_inodes': st.f_files}))"
+  register: erp_storage_preflight_raw
+  changed_when: false
+  when: not ansible_check_mode
+  tags: [erp, erp-preflight]
+
+- name: Parse Docker storage metrics
+  ansible.builtin.set_fact:
+    erp_storage_metrics: "{{ erp_storage_preflight_raw.stdout | from_json }}"
+  when:
+    - not ansible_check_mode
+    - erp_storage_preflight_raw.stdout is defined
+  tags: [erp, erp-preflight]
+
+- name: Perform aggressive image and builder prune if storage remains below threshold
+  when:
+    - not ansible_check_mode
+    - erp_storage_metrics is defined
+    - (erp_storage_metrics.free_gb | float) < (erp_min_disk_free_gb | default(8) | float)
+  tags: [erp, erp-cleanup]
+  block:
+    - name: Warn that storage is low and aggressive prune is starting
+      ansible.builtin.debug:
+        msg: >-
+          Available disk space ({{ erp_storage_metrics.free_gb }} GB) is below the required
+          {{ erp_min_disk_free_gb | default(8) }} GB threshold. Performing aggressive cleanup
+          of all unused images and build cache...
+
+    - name: Remove all unused Docker images not tied to running containers (preserving ERP image)
+      ansible.builtin.shell:
+        cmd: >-
+          set -eo pipefail;
+          TARGET_ID="$(docker image inspect --format '{% raw %}{{.Id}}{% endraw %}' '{{ erp_image }}' 2>/dev/null || true)";
+          if [ -z "$TARGET_ID" ]; then
+            docker image prune --all --force;
+          else
+            CANDIDATES="$(docker images --filter 'dangling=false' --format '{% raw %}{{.ID}}{% endraw %}' | grep -v "^${TARGET_ID:0:12}" || true)";
+            if [ -n "$CANDIDATES" ]; then
+              echo "$CANDIDATES" | xargs -r docker rmi 2>/dev/null || true;
+            fi
+          fi
+      register: erp_aggressive_image_prune
+      changed_when: "'Total reclaimed space: 0B' not in (erp_aggressive_image_prune.stdout | default(''))"
+      failed_when: false
+
+    - name: Remove all Docker builder cache
+      ansible.builtin.command:
+        cmd: docker builder prune --force --all
+      register: erp_aggressive_builder_prune
+      changed_when: "'Total reclaimed space: 0B' not in (erp_aggressive_builder_prune.stdout | default(''))"
+      failed_when: false
+
+    - name: Re-inspect disk space and inodes after aggressive cleanup
+      ansible.builtin.command:
+        cmd: >-
+          python3 -c "import os, json; docker_root = '/var/lib/docker' if os.path.exists('/var/lib/docker') else '/'; st = os.statvfs(docker_root); print(json.dumps({'docker_root': docker_root, 'free_gb': round((st.f_bavail * st.f_frsize) / (1024**3), 2), 'total_gb': round((st.f_blocks * st.f_frsize) / (1024**3), 2), 'free_inodes': st.f_favail, 'total_inodes': st.f_files}))"
+      register: erp_storage_recheck_raw
+      changed_when: false
+
+    - name: Update Docker storage metrics with post-cleanup values
+      ansible.builtin.set_fact:
+        erp_storage_metrics: "{{ erp_storage_recheck_raw.stdout | from_json }}"
+
+- name: Assert sufficient disk space and inodes are available for ERP deployment
+  ansible.builtin.assert:
+    that:
+      - (erp_storage_metrics.free_gb | float) >= (erp_min_disk_free_gb | default(8) | float)
+      - (erp_storage_metrics.free_inodes | int) >= (erp_min_inodes_free | default(100000) | int)
+    fail_msg: >-
+      Preflight storage check failed for ERP deployment on {{ inventory_hostname }}.
+      Available disk space: {{ erp_storage_metrics.free_gb }} GB (minimum required: {{ erp_min_disk_free_gb | default(8) }} GB).
+      Available inodes: {{ erp_storage_metrics.free_inodes }} (minimum required: {{ erp_min_inodes_free | default(100000) }}).
+      Filesystem path: {{ erp_storage_metrics.docker_root }}.
+      Aborting deployment before image pull to avoid out-of-space layer corruption.
+    success_msg: >-
+      Storage preflight check passed: {{ erp_storage_metrics.free_gb }} GB free of {{ erp_storage_metrics.total_gb }} GB,
+      {{ erp_storage_metrics.free_inodes }} inodes free on {{ erp_storage_metrics.docker_root }}.
+  when:
+    - not ansible_check_mode
+    - erp_storage_metrics is defined
+  tags: [erp, erp-preflight]
+
+- name: Start erp
+  community.docker.docker_compose_v2:
+    project_src: "{{ base_dir }}/erp"
+    state: present
+    pull: missing
+  when: not ansible_check_mode
+
+- name: Wait for backend container to be ready
+  ansible.builtin.command: docker compose exec -T backend bench --version
+  args:
+    chdir: "{{ base_dir }}/erp"
+  register: backend_status
+  until: backend_status.rc == 0
+  retries: 12
+  delay: 5
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Clear Frappe cache
+  # Only run if site_config.json exists (site has been created). Fail closed
+  # if the site is missing before cache clear.
+  ansible.builtin.command: >
+    docker compose exec -T backend sh -c
+    'test -f /home/frappe/frappe-bench/sites/{{ site_name }}/site_config.json &&
+     bench --site {{ site_name }} clear-cache'
+  args:
+    chdir: "{{ base_dir }}/erp"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Clear Frappe website cache
+  ansible.builtin.command: >
+    docker compose exec -T backend sh -c
+    'test -f /home/frappe/frappe-bench/sites/{{ site_name }}/site_config.json &&
+     bench --site {{ site_name }} clear-website-cache'
+  args:
+    chdir: "{{ base_dir }}/erp"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Restart backend and frappe-frontend containers
+  ansible.builtin.command: docker compose restart backend frappe-frontend
+  args:
+    chdir: "{{ base_dir }}/erp"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Reclaim disk space from superseded images and stopped one-shot containers
+  ansible.builtin.command:
+    cmd: docker image prune --force
+  register: erp_post_prune_result
+  changed_when: "'Total reclaimed space: 0B' not in (erp_post_prune_result.stdout | default(''))"
+  failed_when: false
+  when:
+    - erp_cleanup_docker | default(true) | bool
+    - not ansible_check_mode
+  tags: [erp, erp-cleanup]

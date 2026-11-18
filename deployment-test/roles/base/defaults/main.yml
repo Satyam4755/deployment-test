@@ -1,0 +1,194 @@
+---
+# Host hardening defaults. These are deliberately NOT environment-specific:
+# development and production must be hardened identically, so any difference
+# belongs in group_vars/<env>/main.yml explicitly, not as a role default that
+# drifts.
+
+# --- identity of the two access layers ---------------------------------
+# The named admin account Ansible connects as. The same value as ansible_user
+# in group_vars/all, named separately so role logic reads clearly.
+base_ssh_login_user: "{{ lookup('env', 'SSH_LOGIN_USER') }}"
+base_ssh_login_home: "/home/{{ base_ssh_login_user }}"
+
+# The privileged deploy owner that an admin escalates to via
+# `sudo -u deployowner` for stack work. Ansible itself escalates to root.
+base_deploy_owner_user: "{{ lookup('env', 'DEPLOY_OWNER_USER') | default('deployowner', true) }}"
+
+# Per-person admin accounts (operators). The list lives in the encrypted vault
+# as `vault_base_operators`: account names and public keys are not published in
+# the repository. Each entry has a `name` and a list of `keys`. The matching
+# yescrypt hash is looked up in `vault_operator_password_hashes` by name.
+# Example (inside group_vars/<env>/vault.yml):
+# vault_base_operators:
+#   - name: alice
+#     keys:
+#       - "ssh-ed25519 AAAAC3... alice@laptop"
+# vault_operator_password_hashes:
+#   alice: "$y$j9T$..."
+base_operators: "{{ vault_base_operators | default([]) }}"
+
+# Group name for admin operators
+base_operator_group: "base_operators"
+
+# deployowner is a service identity with no usable password. Admins become it
+# with sudo, which authenticates the admin's own password (see users.yml).
+
+# CI deploy account (pipeline identity)
+ci_deploy_user: "ci-deploy"
+ci_deploy_authorized_keys: []
+
+# The pipeline account is registered only once a real public key has been
+# supplied. A placeholder key must not create the account or add it to
+# AllowUsers: the bootstrap run expects admin accounts only (RUNBOOK.md), and
+# `ci-deploy` joins the list when the server is registered with the pipeline.
+ci_deploy_registered: >-
+  {{ ci_deploy_authorized_keys | default([]) | length > 0
+     and ci_deploy_authorized_keys | select('search', 'CHANGE_ME') | list | length == 0 }}
+
+# Exactly the names sshd may accept: every admin, plus ci-deploy once the
+# pipeline is registered. deployowner is deliberately absent.
+base_allowed_ssh_users: >-
+  {{ base_operators | map(attribute='name') | list
+     + ([ci_deploy_user] if ci_deploy_registered | bool else []) }}
+
+# --- packages ----------------------------------------------------------
+base_apt_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - ufw
+  - chrony
+  - unattended-upgrades
+  - apt-transport-https
+  - python3-apt
+  - dbus # unattended-upgrades aborts on a missing system bus
+  - rsyslog # journald forwarding target for the audit trail
+
+# --- sshd hardening ----------------------------------------------------
+# Directives applied via lineinfile with `sshd -t` validation, so a typo
+# cannot lock you out. The handler re-validates before restarting.
+base_ssh_directives:
+  - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+  - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+  - { regexp: '^#?KbdInteractiveAuthentication', line: 'KbdInteractiveAuthentication no' }
+  - { regexp: '^#?ChallengeResponseAuthentication', line: 'ChallengeResponseAuthentication no' }
+  - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+  - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+  - { regexp: '^#?PermitUserEnvironment', line: 'PermitUserEnvironment no' }
+  - { regexp: '^#?UsePAM', line: 'UsePAM yes' }
+  - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+  - { regexp: '^#?AllowAgentForwarding', line: 'AllowAgentForwarding no' }
+  - { regexp: '^#?AllowTcpForwarding', line: 'AllowTcpForwarding local' }
+  - { regexp: '^#?PermitTunnel', line: 'PermitTunnel no' }
+  - { regexp: '^#?GatewayPorts', line: 'GatewayPorts no' }
+  - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+  - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+  - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+  - { regexp: '^#?LoginGraceTime', line: 'LoginGraceTime 30' }
+  - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+  - { regexp: '^#?MaxSessions', line: 'MaxSessions 5' }
+  - { regexp: '^#?MaxStartups', line: 'MaxStartups 3:30:10' }
+  - { regexp: '^#?LogLevel', line: 'LogLevel VERBOSE' }
+  - { regexp: '^#?DebianBanner', line: 'DebianBanner no' }
+  - { regexp: '^#?Banner', line: 'Banner /etc/ssh/banner' }
+
+# Modern crypto only. These replace the shipped defaults, which still permit
+# CBC and SHA-1 MACs. Frappe/Traefik clients negotiate TLS 1.2+ anyway.
+base_ssh_ciphers: >-
+  chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+base_ssh_macs: >-
+  hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+base_ssh_kex_algorithms: >-
+  sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256
+base_ssh_ciphers_accepted: true
+base_ssh_macs_accepted: true
+base_ssh_kex_algorithms_accepted: true
+
+# --- firewall ----------------------------------------------------------
+# Only these ports accept inbound traffic. 80/443 are the Traefik edge; the
+# SSH port matches ansible_port.
+base_firewall_allowed_tcp_ports:
+  - "{{ ansible_port | string }}"
+  - "80"
+  - "443"
+# rate-limit rather than allow on SSH: blocks brute force without a second
+# firewall to maintain.
+base_firewall_ssh_rate_limit: true
+base_firewall_enable_ipv6: true
+base_firewall_logging: 'low'
+
+# UFW's INPUT chain is bypassed by Docker's DOCKER chain for bridge-published
+# ports, so a `ports:` entry in any compose file would be exposed even with
+# UFW denying everything. This role installs DOCKER-USER rules that re-apply
+# the UFW allowlist to Docker-published traffic, closing that hole. Set false
+# only if you are certain no compose file publishes a bridge-mode port.
+base_firewall_docker_user_rules: true
+
+# --- system tuning -----------------------------------------------------
+# Kernel hardening. Each entry is applied via sysctl --system and written to
+# /etc/sysctl.d/ so it survives reboot.
+base_sysctl_settings:
+  # Network
+  net.ipv4.conf.all.rp_filter: '1'
+  net.ipv4.conf.default.rp_filter: '1'
+  net.ipv4.conf.all.accept_redirects: '0'
+  net.ipv4.conf.default.accept_redirects: '0'
+  net.ipv4.conf.all.secure_redirects: '0'
+  net.ipv4.conf.all.send_redirects: '0'
+  net.ipv4.conf.all.accept_source_route: '0'
+  net.ipv4.conf.default.accept_source_route: '0'
+  net.ipv4.conf.all.log_martians: '1'
+  net.ipv4.conf.all.accept_local: '0'
+  net.ipv4.tcp_syncookies: '1'
+  net.ipv4.ip_forward: '0'
+  net.ipv4.icmp_echo_ignore_broadcasts: '1'
+  net.ipv6.conf.all.accept_redirects: '0'
+  net.ipv6.conf.all.accept_ra: '0'
+  # Kernel
+  kernel.randomize_va_space: '2'
+  kernel.kptr_restrict: '2'
+  kernel.dmesg_restrict: '1'
+  kernel.yama.ptrace_scope: '1'
+  kernel.unprivileged_bpf_disabled: '1'
+  fs.protected_hardlinks: '1'
+  fs.protected_symlinks: '1'
+  fs.suid_dumpable: '0'
+  # MariaDB runs with a 1G InnoDB pool; a low swappiness stops the database
+  # buffer pool being paged out in favour of cold cache.
+  vm.swappiness: '1'
+
+# Bound the journal so a log-flood attack cannot fill the root filesystem.
+base_journald_settings:
+  Storage: persistent
+  RuntimeMaxUse: 200M
+  SystemMaxUse: 1G
+  MaxRetentionSec: 2week
+  Compress: 'true'
+  ForwardToSyslog: 'true'
+  RateLimitInterval: 30s
+  RateLimitBurst: 10000
+
+# Clock accuracy is a hard dependency, not a nicety: ACME certificate
+# validation, CrowdSec ban windows and Frappe's own timestamp checks all fail
+# under drift.
+base_chrony_packages: [chrony]
+
+# Unattended security updates.
+base_unattended_upgrades_enabled: true
+base_unattended_upgrades_origins:
+  - '${distro_id}:${distro_codename}-security'
+  - '${distro_id}ESMApps:${distro_codename}-apps-security'
+  - '${distro_id}ESM:${distro_codename}-infra-security'
+  - '${distro_id}:${distro_codename}-updates'
+# Reboots are never automatic: an unattended reboot mid-deploy would drop the
+# stack. Surface it and let a human or a deploy playbook decide.
+base_unattended_upgrades_automatic_reboot: false
+
+# Swap: MariaDB and the Frappe workers are memory-hungry. Create a small swap
+# file as an OOM safety net rather than a performance crutch.
+base_swap_enabled: true
+base_swap_file: /swapfile
+base_swap_size_mb: 2048
+
+# Default umask for new files, so nothing world-readable leaks by default.
+base_default_umask: '0027'

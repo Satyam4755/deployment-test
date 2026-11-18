@@ -1,0 +1,235 @@
+---
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ base_apt_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [base, packages]
+
+- name: Configure unattended security upgrades
+  when: base_unattended_upgrades_enabled | bool
+  tags: [base, updates]
+  block:
+    - name: Ensure unattended-upgrades configuration directory exists
+      ansible.builtin.file:
+        path: /etc/apt/apt.conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Enable unattended security updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: '0644'
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+          # Never reboot on your own: an unattended reboot during a deploy
+          # takes the whole stack down. A human (or playbooks/server.yml after
+          # a deliberate check) decides.
+          APT::Periodic::Unattended-Upgrade-Reboot "0";
+
+    - name: Restrict unattended upgrades to security origins
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/51unattended-upgrades-hardened
+        mode: '0644'
+        content: |
+          // Origins this host will auto-apply. Security + updates only.
+          Unattended-Upgrade::Origins-Pattern {
+          {% for origin in base_unattended_upgrades_origins %}
+            "{{ origin }}";
+          {% endfor %}
+          };
+          // Never auto-remove packages: doing so mid-deploy can pull the
+          // kernel out from under a running container stack.
+          Unattended-Upgrade::Remove-Unused-Dependencies "false";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::SyslogEnable "true";
+
+- name: Configure time synchronisation
+  # Not optional. ACME validation, CrowdSec ban windows and Frappe's own
+  # timestamp checks all break silently under clock drift.
+  tags: [base, time]
+  block:
+    - name: Install chrony
+      ansible.builtin.apt:
+        name: "{{ base_chrony_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure chrony is enabled and running
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Restrict chrony to NTP only
+      ansible.builtin.copy:
+        dest: /etc/chrony/chrony.conf
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/base).
+          pool ntp.ubuntu.com iburst maxsources 4
+          driftfile /var/lib/chrony/chrony.drift
+          makestep 1.0 3
+          rtcsync
+          # Log adjustments instead of writing to the system clock abruptly.
+          logdir /var/log/chrony
+      notify: Restart chrony
+
+- name: Apply kernel and network hardening
+  tags: [base, sysctl]
+  block:
+    - name: Write sysctl hardening drop-in
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/60-deployment-hardening.conf
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/base).
+          {% for key, value in base_sysctl_settings | dictsort %}
+          {{ key }} = {{ value }}
+          {% endfor %}
+      notify: Reload sysctl
+
+    - name: Apply sysctl settings immediately
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/60-deployment-hardening.conf
+        state: present
+        reload: true
+      loop: "{{ base_sysctl_settings | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+- name: Bound journal growth
+  # Without this, a log-flood or a runaway debug level fills the root
+  # filesystem and takes the database down with it.
+  tags: [base, journald]
+  block:
+    - name: Ensure journald configuration directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: '0755'
+
+    - name: Limit journal size and persist logs across reboots
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-deployment-hardening.conf
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/base).
+          {% for key, value in base_journald_settings | dictsort %}
+          {{ key }}={{ value }}
+          {% endfor %}
+      notify: Restart journald
+
+- name: Set a restrictive default umask
+  tags: [base, permissions]
+  block:
+    - name: Apply umask to PAM sessions and user login
+      ansible.builtin.copy:
+        dest: /etc/profile.d/00-deployment-umask.sh
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/base).
+          umask {{ base_default_umask }}
+
+    - name: Ensure the shadow database is not world readable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: '0640'
+      loop:
+        - /etc/shadow
+        - /etc/gshadow
+
+- name: Configure swap
+  tags: [base, swap]
+  when: base_swap_enabled | bool
+  block:
+    - name: Check for an existing swap file
+      ansible.builtin.stat:
+        path: "{{ base_swap_file }}"
+      register: base_swap_stat
+
+    - name: Verify the existing swap file has the declared size
+      # Resizing swap under a running database is not a safe automatic action,
+      # and a partial `dd` from an interrupted run looks like a valid file.
+      # Fail with an explicit recovery path instead of silently resizing or
+      # calling mkswap on the wrong file.
+      ansible.builtin.assert:
+        that:
+          - base_swap_stat.stat.size | int == (base_swap_size_mb | int) * 1024 * 1024
+        fail_msg: >-
+          {{ base_swap_file }} is {{ base_swap_stat.stat.size | int }} bytes but
+          base_swap_size_mb is {{ base_swap_size_mb }}. The role does not resize
+          swap automatically. To resize deliberately: swapoff {{ base_swap_file }},
+          remove the file, set the new size, and re-run. If a previous dd was
+          interrupted, remove the partial file and re-run.
+        quiet: true
+      when: base_swap_stat.stat.exists
+
+    - name: Create the swap file
+      # `dd` is used rather than a module because fallocate-created swap files
+      # are sparse and can be written to, which is a local privilege
+      # escalation path. dd produces a properly allocated file. conv=fsync
+      # makes the size durable before mkswap reads it.
+      ansible.builtin.command:
+        cmd: >-
+          dd if=/dev/zero of={{ base_swap_file }}
+          bs=1M count={{ base_swap_size_mb }} conv=fsync status=none
+        creates: "{{ base_swap_file }}"
+      when: not base_swap_stat.stat.exists
+      changed_when: true
+
+    - name: Restrict swap file permissions
+      # In a real run the file exists here whether it was just created or
+      # already present. In check mode the creation is skipped, so only apply
+      # this to a file that the stat above actually found.
+      ansible.builtin.file:
+        path: "{{ base_swap_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: base_swap_stat.stat.exists or not ansible_check_mode
+
+    - name: Read the active swap devices
+      # `swapon` on an already-active file fails with a message that varies by
+      # util-linux version ("already active", "Device or resource busy"), so
+      # the list is the reliable way to leave existing swap alone. This probe
+      # is read-only and still runs in check mode.
+      ansible.builtin.command:
+        cmd: swapon --noheadings --show=NAME
+      register: base_active_swap
+      changed_when: false
+      check_mode: false
+
+    - name: Initialise the swap file
+      # A zero-filled file has no swap signature. Without mkswap, the first
+      # swapon always fails with "read swap header failed: Invalid argument".
+      ansible.builtin.command:
+        cmd: mkswap {{ base_swap_file }}
+      when: base_swap_file not in base_active_swap.stdout_lines
+      changed_when: true
+
+    - name: Enable swap
+      ansible.builtin.command:
+        cmd: swapon {{ base_swap_file }}
+      when: base_swap_file not in base_active_swap.stdout_lines
+      changed_when: true
+
+    - name: Persist swap across reboots
+      # Edit only our own line. Replacing /etc/fstab would drop every other
+      # mount on the host, including provider data volumes.
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^{{ base_swap_file | regex_escape }}\s'
+        line: "{{ base_swap_file }} none swap sw 0 0"
+        state: present
+        create: true
+        mode: '0644'

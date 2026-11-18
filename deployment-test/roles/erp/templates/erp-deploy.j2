@@ -1,0 +1,139 @@
+#!/bin/bash
+# erp-deploy — deploy a new application image by digest.
+# Runs as root via sudo from the ci-deploy account.
+# Usage: erp-deploy <sha256:digest>
+
+set -euo pipefail
+
+CONFIG_FILE="/etc/erp/deploy.conf"
+DEPLOY_LOG="/var/log/erp-deploys.log"
+
+# Load configuration
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: Config file $CONFIG_FILE not found" >&2
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+# Validate arguments
+if [[ $# -ne 1 ]]; then
+    echo "Usage: $0 <sha256:digest>" >&2
+    exit 1
+fi
+
+DIGEST="$1"
+
+# Validate digest format
+if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+    echo "ERROR: Invalid digest format. Must be sha256:<64 hex chars>" >&2
+    exit 1
+fi
+
+# Log function: progress goes to stdout, which the pipeline captures. The
+# host audit record is written once, at the end (or by the failure trap), so
+# the log stays one line per deploy as documented in ADR-010.
+log() {
+    echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $1"
+}
+
+# Actor and workflow run come from CI. The ci-deploy sudo rule preserves only
+# these two variables. A manual run falls back to the invoking account.
+ACTOR="${DEPLOY_ACTOR:-${SUDO_USER:-$(id -un)}}"
+WORKFLOW_RUN="${DEPLOY_RUN_URL:-none}"
+
+record_deploy() {
+    local result="$1"
+    # The log is root-only (0600) and append-only: recreate the mode if a
+    # previous cleanup removed the file.
+    touch "$DEPLOY_LOG"
+    chown root:root "$DEPLOY_LOG"
+    chmod 0600 "$DEPLOY_LOG"
+    printf '%s environment=%s previous=%s new=%s actor=%s workflow_run=%s result=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "${ENVIRONMENT:-unknown}" "${PREVIOUS_DIGEST:-none}" "$DIGEST" \
+        "$ACTOR" "$WORKFLOW_RUN" "$result" >> "$DEPLOY_LOG"
+}
+
+PREVIOUS_DIGEST="none"
+# A failed deploy is part of the record too. `success` clears the trap.
+trap 'record_deploy failure' EXIT
+
+log "=== Deploy started: digest=$DIGEST ==="
+log "App directory: $APP_DIR"
+log "Site name: $SITE_NAME"
+
+cd "$APP_DIR"
+
+# Update the image in compose file (replace tag or previous digest with the
+# digest). IMAGE_REPO is rendered by Ansible; there is no shell variable with
+# the image name at runtime.
+IMAGE_REPO="{{ erp_image_repository }}"
+
+# Record the digest that is running before the compose file is rewritten. The
+# first provisioning deploy still uses a tag, so `none` is the honest value.
+PREVIOUS_DIGEST="$(grep -oE "${IMAGE_REPO}@sha256:[a-f0-9]{64}" "$COMPOSE_FILE" | head -n1 | sed 's/.*@//' || true)"
+PREVIOUS_DIGEST="${PREVIOUS_DIGEST:-none}"
+
+log "Updating compose file with digest..."
+sed -i -E "s|image: \"?${IMAGE_REPO}[:@][^\"[:space:]]*\"?|image: \"${IMAGE_REPO}@${DIGEST}\"|g" "$COMPOSE_FILE"
+
+# Pull the new image
+log "Pulling image..."
+docker compose pull
+
+# Recreate containers with the new image
+log "Recreating containers..."
+docker compose up -d --force-recreate --remove-orphans
+
+# Wait for backend to be ready
+log "Waiting for backend..."
+for i in {1..12}; do
+    if docker compose exec -T backend bench --version >/dev/null 2>&1; then
+        log "Backend is ready"
+        break
+    fi
+    sleep 5
+    if [[ $i -eq 12 ]]; then
+        log "ERROR: Backend did not become ready"
+        exit 1
+    fi
+done
+
+# Run migrations
+log "Running migrations..."
+docker compose exec -T backend bench --site "$SITE_NAME" migrate
+
+# Clear caches
+log "Clearing caches..."
+docker compose exec -T backend bench --site "$SITE_NAME" clear-cache
+docker compose exec -T backend bench --site "$SITE_NAME" clear-website-cache
+
+# Restart the background workers and scheduler after the cache clear so they
+# run the new image's code and configuration.
+log "Restarting workers and scheduler..."
+docker compose restart queue-short queue-long scheduler
+
+# Wait for health check
+log "Running health check..."
+for i in {1..12}; do
+    if curl --silent --show-error --fail --max-time 10 \
+        --resolve "$DOMAIN:443:127.0.0.1" \
+        "https://$DOMAIN/api/method/ping" >/dev/null 2>&1; then
+        log "Health check passed"
+        break
+    fi
+    sleep 5
+    if [[ $i -eq 12 ]]; then
+        log "ERROR: Health check failed"
+        exit 1
+    fi
+done
+
+# Record the deploy
+VERSION_LABEL="${DIGEST#sha256:}"
+VERSION_LABEL="${VERSION_LABEL:0:12}"
+record_deploy success
+trap - EXIT
+log "Deploy completed successfully: version=$VERSION_LABEL digest=$DIGEST"
+
+exit 0

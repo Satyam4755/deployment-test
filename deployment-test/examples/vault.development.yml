@@ -1,0 +1,77 @@
+---
+# Development vault template.
+#
+# This file is a TEMPLATE and a CI FIXTURE. It contains only placeholders.
+# It is never loaded by Ansible: the real vault lives at
+# group_vars/development/vault.yml, which is gitignored.
+#
+# To set up a development control machine:
+#   cp examples/vault.development.yml group_vars/development/vault.yml
+#   # fill in the real values
+#   ansible-vault encrypt --vault-id dev@prompt group_vars/development/vault.yml
+#
+# CI copies this file over group_vars/development/vault.yml so that
+# `ansible-lint` and `ansible-playbook --syntax-check` can resolve every
+# variable without a vault password. That is why the values must stay
+# placeholders: anything real here would defeat ADR-026.
+
+# --- confidential identifiers -------------------------------------------
+# Not cryptographic secrets, but they reveal the site, the organisation and
+# the people. Keep the real values in the encrypted vault only.
+vault_domain: "dev.example.com"
+vault_site_name: "dev.example.com"
+vault_traefik_dashboard_host: "traefik.dev.example.com"
+vault_ssh_port: "22222"
+vault_app_image_repository: "example-registry/erp"
+vault_backup_remote_name: "example-backup"
+vault_backup_bucket: "example-backups"
+vault_backup_endpoint: ""
+
+# Outgoing mail identity. The sender name appears in every message the ERP
+# sends, so it is as identifying as the domain.
+vault_mail_server: "smtp.example.com"
+vault_mail_login: "erp@example.com"
+vault_mail_sender_name: "ERP"
+
+# Let's Encrypt account contact. Required in every edge mode.
+vault_cloudflare_email: "ops@example.com"
+
+# --- application and infrastructure secrets ------------------------------
+vault_cf_token: "CHANGE_ME_DEV_CF_TOKEN"
+# Legacy names kept so a vault created before ADR-026 still resolves. New
+# vaults should set the canonical keys above and leave these empty.
+vault_cf_dns_api_token: ""
+vault_crowdsec_key: "CHANGE_ME_CROWDSEC_LAPI_KEY"
+vault_crowdsec_firewall_key: "CHANGE_ME_CROWDSEC_FIREWALL_KEY"
+vault_db_root_password: "CHANGE_ME_DEV_DB_ROOT"
+vault_db_encryption_key: "CHANGE_ME_BASE64_KEY"
+vault_db_key_password: "CHANGE_ME_KEY_PASSWORD"
+vault_admin_password: "CHANGE_ME_DEV_ADMIN"
+vault_mail_password: "CHANGE_ME_DEV_MAIL_PASSWORD"
+vault_telegram_bot_token: "CHANGE_ME_TELEGRAM_BOT_TOKEN"
+vault_telegram_chat_id: "CHANGE_ME_TELEGRAM_CHAT_ID"
+
+# Offsite backup credentials (rclone, scoped to one bucket).
+vault_backup_access_key_id: "CHANGE_ME_BACKUP_ACCESS_KEY_ID"
+vault_backup_secret_access_key: "CHANGE_ME_BACKUP_SECRET_ACCESS_KEY"
+
+# --- identities ----------------------------------------------------------
+# Per-person admin accounts. Names and public keys are kept here so the
+# repository does not publish who can log in.
+vault_base_operators:
+  - name: "CHANGE_ME_ADMIN_NAME"
+    keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE CHANGEME"
+
+# One yescrypt hash per admin, keyed by the same name. Generate with:
+#   mkpasswd --method=yescrypt
+vault_operator_password_hashes:
+  CHANGE_ME_ADMIN_NAME: "CHANGE_ME_YESCRYPT_HASH_FOR_ADMIN"
+
+# Per-person Traefik dashboard basic-auth, one bcrypt hash per admin.
+vault_traefik_dashboard_users:
+  CHANGE_ME_ADMIN_NAME: "$2b$12$CHANGE_ME_BCRYPT_HASH_FOR_ADMIN"
+
+# CI deploy account public keys (pipeline identity). The private half lives in
+# the GitHub environment secret CI_DEPLOY_SSH_KEY, never here.
+vault_ci_deploy_authorized_keys: []

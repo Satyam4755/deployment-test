@@ -1,0 +1,36 @@
+---
+# The image repository names the registry namespace the business owns, so it
+# is a confidential identifier and is defined once in group_vars/all/main.yml
+# as `{{ vault_app_image_repository }}`. The identity here is either a tag
+# (provisioning default) or, for a deploy, the repository plus a sha256 digest.
+erp_image_version: "1.16.8"
+erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
+
+# --- initial site configuration -----------------------------------------
+# Applied once by the one-shot configurator, immediately after the site is
+# created. Existing keys are never overwritten, so an operator change survives
+# a re-run. frappe_mail_server and frappe_mail_login have no safe default: set
+# them per environment when frappe_email_enabled is true.
+frappe_enable_logger: true
+frappe_host_name: "https://{{ domain }}"
+frappe_email_enabled: true
+frappe_mail_server: ""
+frappe_mail_port: 587
+frappe_mail_login: ""
+frappe_mail_use_ssl: false
+frappe_mail_use_tls: true
+frappe_auto_email_id: "{{ frappe_mail_login }}"
+# The sender name identifies the business, so it is a vault value.
+frappe_email_sender_name: "{{ vault_mail_sender_name | mandatory }}"
+
+# --- storage preflight & automated docker cleanup -----------------------
+# Minimum required free disk space (in GB) and inodes on Docker storage partition before pulling ERP.
+erp_min_disk_free_gb: 8
+erp_min_inodes_free: 100000
+
+# Automated Docker cleanup before image pull
+erp_cleanup_docker: true
+# Retention window for unused images (running containers are never touched)
+erp_prune_images_until: "24h"
+# Retention window for BuildKit build cache
+erp_prune_builder_until: "24h"

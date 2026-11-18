@@ -1,0 +1,89 @@
+---
+# sshd hardening. Every write is validated with `sshd -t` and the handler
+# re-validates before restarting, so a malformed directive fails the run
+# instead of taking SSH down on a host we may not be able to reach.
+
+- name: Write the SSH login banner
+  # Leaks less than the default Ubuntu banner, which names the distro and
+  # version to anyone who connects.
+  ansible.builtin.copy:
+    dest: /etc/ssh/banner
+    mode: '0644'
+    content: |
+      This is a private system. Access is restricted to authorised users and
+      all activity is logged.
+  tags: [base, ssh]
+
+- name: Apply sshd hardening directives
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    # The load-bearing line in this file: an invalid directive is rejected by
+    # sshd itself before it can ever be activated by the handler.
+    validate: 'sshd -t -f %s'
+  loop: "{{ base_ssh_directives }}"
+  loop_control:
+    label: "{{ item.regexp }}"
+  notify: Restart sshd
+  tags: [base, ssh]
+
+- name: Restrict the accepted cipher, MAC and key-exchange algorithms
+  # Modern cryptography only. Ubuntu's shipped defaults still permit CBC
+  # ciphers and SHA-1 MACs; Traefik and Frappe clients negotiate TLS 1.2+
+  # regardless, so nothing here breaks the stack.
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    validate: 'sshd -t -f %s'
+  loop:
+    - regexp: '^#?Ciphers'
+      line: "Ciphers {{ base_ssh_ciphers }}"
+    - regexp: '^#?MACs'
+      line: "MACs {{ base_ssh_macs }}"
+    - regexp: '^#?KexAlgorithms'
+      line: "KexAlgorithms {{ base_ssh_kex_algorithms }}"
+  loop_control:
+    label: "{{ item.regexp }}"
+  notify: Restart sshd
+  tags: [base, ssh]
+
+- name: Confirm admin accounts can authenticate before enforcing restrictions
+  # Ordering matters and is easy to get wrong: if the keys are not in place,
+  # or PasswordAuthentication was already `no` with no key installed, locking
+  # down further strands every operator. This asserts the precondition, it
+  # does not test a live connection (which the handler does).
+  ansible.builtin.stat:
+    path: "/home/{{ item.name }}/.ssh/authorized_keys"
+  loop: "{{ base_operators }}"
+  register: base_authorized_keys_stat
+  tags: [base, ssh]
+
+- name: Fail if any admin account has no usable key
+  ansible.builtin.fail:
+    msg: >-
+      /home/{{ item.item.name }}/.ssh/authorized_keys is missing or empty for
+      {{ item.item.name }}. Refusing to disable password authentication
+      until at one authorised key is installed, because that would lock out
+      every operator.
+  loop: "{{ base_authorized_keys_stat.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - not item.stat.exists or (item.stat.size | default(0)) == 0
+  tags: [base, ssh]
+
+- name: Lock down sensitive files and directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/ssh/sshd_config, mode: '0600' }
+    - { path: /etc/ssh/sshd_config.d, mode: '0755' }
+  loop_control:
+    label: "{{ item.path }}"
+  notify: Restart sshd
+  tags: [base, ssh]

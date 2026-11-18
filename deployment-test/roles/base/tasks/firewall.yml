@@ -1,0 +1,179 @@
+---
+# UFW firewall, plus the DOCKER-USER rules that keep it meaningful on a host
+# that runs containers.
+#
+# Ordering note: UFW policies only take effect once UFW is *enabled*, so the
+# SSH allow rule is in place long before any deny rule can bite. The enable
+# step is therefore last, and the block/rescue re-asserts SSH access if
+# anything in between fails.
+
+- name: Configure the UFW allowlist
+  tags: [base, firewall]
+  block:
+    - name: Enable IPv6 filtering in UFW
+      # Without IPV6=yes, a host with IPv6 connectivity silently accepts
+      # inbound v6 traffic on every port, because UFW only manages the v4
+      # rules. A v4-only allowlist is not a firewall.
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^IPV6='
+        line: 'IPV6=yes'
+        mode: '0644'
+
+    - name: Reset UFW to a known state
+      # The rules below are then re-applied wholesale, so a rule added by
+      # hand in a previous session cannot survive as a hidden hole.
+      community.general.ufw:
+        state: reset
+
+    - name: Allow the SSH port
+      # `limit` rather than `allow`: permits six connections per host per
+      # 30s from a single source and drops the rest, which is the whole
+      # defence against online password guessing, at no extra cost.
+      community.general.ufw:
+        rule: "{{ 'limit' if base_firewall_ssh_rate_limit else 'allow' }}"
+        to_port: "{{ ansible_port }}"
+        proto: tcp
+        comment: "Ansible SSH"
+
+    - name: Allow the Traefik edge ports
+      # 80/443 only. Nothing else is published to the internet: MariaDB,
+      # Redis, the socket-proxy and every Frappe service live on networks
+      # that expose no ports at all.
+      community.general.ufw:
+        rule: allow
+        to_port: "{{ item }}"
+        proto: tcp
+        comment: "Traefik edge"
+      loop: "{{ base_firewall_allowed_tcp_ports | difference([ansible_port | string]) }}"
+      loop_control:
+        label: "port {{ item }}"
+
+    - name: Set the default deny policy for incoming traffic
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Set the default allow policy for outgoing traffic
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Enable UFW with logging
+      community.general.ufw:
+        state: enabled
+        logging: "{{ base_firewall_logging }}"
+
+  rescue:
+    - name: Rescue — re-assert SSH access
+      # Reached only if a task above failed. The SSH rule is re-applied and
+      # UFW is left enabled so a partial configuration still denies inbound
+      # traffic, rather than reverting to a wide-open host.
+      community.general.ufw:
+        rule: "{{ 'limit' if base_firewall_ssh_rate_limit else 'allow' }}"
+        to_port: "{{ ansible_port }}"
+        proto: tcp
+        comment: "Ansible SSH (rescue)"
+
+    - name: Rescue — enable UFW anyway
+      community.general.ufw:
+        state: enabled
+
+    - name: Rescue — abort the run so the failure is not hidden
+      ansible.builtin.fail:
+        msg: >-
+          Firewall configuration failed and the rescue path has restored SSH
+          access. Re-run with --check --diff to see what went wrong before
+          applying again.
+
+- name: Constrain Docker-published traffic to the UFW allowlist
+  # The part that makes the allowlist above real. Docker inserts its own
+  # rules ahead of UFW's INPUT chain, so any container port published in
+  # bridge mode is reachable from the internet *even though UFW denies
+  # everything*. Without these rules the deny policy is decorative the moment
+  # a `ports:` entry is added to a compose file.
+  #
+  # DOCKER-USER is the hook Docker guarantees to consult for
+  # container-originated traffic. Dropping unmatched packets there restores
+  # UFW's intent.
+  when: base_firewall_docker_user_rules | bool
+  tags: [base, firewall, docker]
+  block:
+    - name: Install the DOCKER-USER chain manager
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/apply-docker-user-rules
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Managed by Ansible (roles/base). Mirrors the UFW allowlist into
+          # Docker's DOCKER-USER chain.
+          #
+          # Docker rebuilds its chains on every daemon restart, discarding
+          # anything hooked into DOCKER-USER, so this is re-run from a systemd
+          # drop-in after each start.
+          set -euo pipefail
+
+          CHAIN=DOCKER-USER
+          ALLOWED_PORTS=({{ base_firewall_allowed_tcp_ports | map('string') | join(' ') }})
+          SSH_PORT={{ ansible_port }}
+
+          # Recreate from scratch, so the result does not depend on whatever
+          # the previous run or a manual edit left behind.
+          iptables -N "$CHAIN" 2>/dev/null || true
+          iptables -F "$CHAIN"
+
+          # Loopback and existing connections are always permitted.
+          iptables -A "$CHAIN" -o lo -j ACCEPT
+          iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+          # Published port -> the only host that should own it is the edge
+          # proxy. Everything a container exposes beyond the allowlist is
+          # dropped, which makes "no published ports" an enforced guarantee
+          # rather than a convention.
+          iptables -A "$CHAIN" -p tcp --dport "$SSH_PORT" -j ACCEPT
+          for port in "${ALLOWED_PORTS[@]}"; do
+            [ "$port" = "$SSH_PORT" ] && continue
+            iptables -A "$CHAIN" -p tcp --dport "$port" -j ACCEPT
+          done
+
+          iptables -A "$CHAIN" -j DROP
+      notify: Apply DOCKER-USER rules
+
+    - name: Create Docker systemd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure the rules reapply when Docker restarts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/10-firewall.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/base).
+          [Unit]
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          ExecStartPost=/usr/local/sbin/apply-docker-user-rules
+          ExecReload=/usr/local/sbin/apply-docker-user-rules
+      notify:
+        - Reload systemd
+        - Apply DOCKER-USER rules
+
+    - name: Reload systemd daemon to register Docker firewall drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Apply DOCKER-USER rules immediately if Docker is active
+      ansible.builtin.command:
+        cmd: /usr/local/sbin/apply-docker-user-rules
+      failed_when: false
+      changed_when: false

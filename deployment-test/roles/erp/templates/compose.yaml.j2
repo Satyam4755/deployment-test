@@ -1,0 +1,288 @@
+services:
+  asset-syncer:
+    container_name: asset-syncer
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    entrypoint: []
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        VERSION="{{ erp_image_version }}"
+        MARKER="/mnt/assets_vol/.built-for-$${VERSION}"
+        echo "Refreshing assets in anonymous volume (image version $${VERSION})...";
+
+        # `bench build --production` is the slowest step in the whole deploy
+        # and it depends only on the image contents. Because every service here
+        # depends_on service_completed_successfully, re-running it on every
+        # deploy blocked the entire stack for minutes even when nothing had
+        # changed. The marker makes the build a no-op unless the image version
+        # moved, and it is written *after* validation, so a half-finished build
+        # can never be mistaken for a good one.
+        if [ -f "$${MARKER}" ]; then
+          echo "Assets already built for $${VERSION}; skipping bench build.";
+        else
+          echo "No marker for $${VERSION}; running bench build --production.";
+          bench build --production;
+        fi
+
+        if command -v rsync &> /dev/null; then
+          rsync -aL --delete --exclude '.built-for-*' /home/frappe/frappe-bench/sites/assets/ /mnt/assets_vol/;
+        else
+          find /mnt/assets_vol/ -maxdepth 1 -name '.built-for-*' -delete;
+          rm -rf /mnt/assets_vol/*;
+          cp -aL /home/frappe/frappe-bench/sites/assets/. /mnt/assets_vol/;
+        fi;
+
+        echo "Validating asset sync...";
+        python3 -c "
+        import json, os, sys
+        image_assets_path = '/home/frappe/frappe-bench/sites/assets'
+        volume_assets_path = '/mnt/assets_vol'
+        with open(f'{image_assets_path}/assets.json') as f:
+            assets = json.load(f)
+        missing = 0
+        for k, v in assets.items():
+            file_path = f'{volume_assets_path}' + v.replace('/assets/', '/')
+            if not os.path.exists(file_path):
+                print(f'ERROR: Asset {v} referenced in assets.json not found at {file_path}!')
+                missing += 1
+        if missing > 0:
+            print(f'Asset validation failed! {missing} missing files.')
+            sys.exit(1)
+        print('Asset validation passed successfully.')
+        "
+
+        # Written only after validation passes.
+        touch "$${MARKER}"
+        echo "Assets ready for $${VERSION}."
+    volumes:
+      - assets-vol:/mnt/assets_vol
+    networks:
+      - erp_default
+
+  configurator:
+    container_name: configurator
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    command:
+      - bash
+      - -c
+      - >
+        set -euo pipefail;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_SOCKETIO";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+        /docker/scripts/configure-site.sh
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      REDIS_SOCKETIO: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+      DB_ROOT_USER: root
+      SITE_NAME: "{{ site_name }}"
+      FRAPPE_ENABLE_LOGGER: "{{ frappe_enable_logger | bool | ternary('1', '0') }}"
+      FRAPPE_HOST_NAME: "{{ frappe_host_name }}"
+      FRAPPE_EMAIL_ENABLED: "{{ frappe_email_enabled | bool | ternary('1', '0') }}"
+      FRAPPE_MAIL_SERVER: "{{ frappe_mail_server }}"
+      FRAPPE_MAIL_PORT: "{{ frappe_mail_port }}"
+      FRAPPE_MAIL_LOGIN: "{{ frappe_mail_login }}"
+      FRAPPE_MAIL_USE_SSL: "{{ frappe_mail_use_ssl | bool | ternary('1', '0') }}"
+      FRAPPE_MAIL_USE_TLS: "{{ frappe_mail_use_tls | bool | ternary('1', '0') }}"
+      FRAPPE_AUTO_EMAIL_ID: "{{ frappe_auto_email_id }}"
+      FRAPPE_EMAIL_SENDER_NAME: "{{ frappe_email_sender_name }}"
+      FRAPPE_SITE_APPS: "{{ frappe_site_apps | join(' ') }}"
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+      - assets-vol:/home/frappe/frappe-bench/sites/assets
+      - ./configure-site.sh:/docker/scripts/configure-site.sh:ro
+    secrets: # engine-owned copies, readable by the frappe container user
+      - db_root_password
+{% if frappe_email_enabled | bool %}
+      - mail_password
+{% endif %}
+    networks:
+      - erp_default
+      - erp-db
+      - erp-cache
+    depends_on:
+      asset-syncer:
+        condition: service_completed_successfully
+
+  backend:
+    container_name: backend
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    command: ["bench", "serve", "--port", "8000"]
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+      - assets-vol:/home/frappe/frappe-bench/sites/assets
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - erp-db
+      - erp-cache
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      asset-syncer:
+        condition: service_completed_successfully
+
+  websocket:
+    container_name: websocket
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    entrypoint:
+      - node
+    command:
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - erp-cache
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      asset-syncer:
+        condition: service_completed_successfully
+
+  frappe-frontend:
+    container_name: frappe-frontend
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    entrypoint:
+      - nginx-entrypoint.sh
+    command:
+      - nginx
+      - -g
+      - "daemon off;"
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: "{{ site_name }}"
+      SOCKETIO: websocket:9000
+      # The frontend trusts X-Forwarded-For from the Traefik container on
+      # traefik-public, not from loopback.
+      UPSTREAM_REAL_IP_ADDRESS: traefik
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+      - assets-vol:/home/frappe/frappe-bench/sites/assets
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - traefik-public
+    depends_on:
+      backend:
+        condition: service_started
+      asset-syncer:
+        condition: service_completed_successfully
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-public"
+      - "traefik.http.routers.frappe-frontend.rule=Host(`{{ domain }}`)"
+      - "traefik.http.routers.frappe-frontend.entrypoints=websecure"
+      - "traefik.http.routers.frappe-frontend.tls=true"
+      - "traefik.http.routers.frappe-frontend.tls.certresolver={{ traefik_cert_resolver }}"
+      - "traefik.http.services.frappe-frontend.loadbalancer.server.port=8080"
+      # Middleware chain, applied in order. These are all file-provider
+      # middlewares defined by the traefik role in dynamic.yaml.j2 — this
+      # compose file must not redefine them, or it silently shadows the
+      # hardened versions.
+      - >-
+        traefik.http.routers.frappe-frontend.middlewares={% if traefik_crowdsec_enabled | default(false) %}crowdsec-bouncer@file,{% endif %}{% if traefik_origin_cloudflare_only | default(false) %}cloudflare-allow@file,{% endif %}rate-limit-frappe@file,frappe-csp@file,security-headers-frappe@file
+
+  queue-short:
+    container_name: queue-short
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    command: ["bench", "worker", "--queue", "short,default"]
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - erp-db
+      - erp-cache
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      asset-syncer:
+        condition: service_completed_successfully
+
+  queue-long:
+    container_name: queue-long
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - erp-db
+      - erp-cache
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      asset-syncer:
+        condition: service_completed_successfully
+
+  scheduler:
+    container_name: scheduler
+    image: "{{ erp_image }}"
+    pull_policy: missing
+    command: ["bench", "schedule"]
+    volumes:
+      - sites-vol:/home/frappe/frappe-bench/sites
+    restart: unless-stopped
+    networks:
+      - erp_default
+      - erp-db
+      - erp-cache
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      asset-syncer:
+        condition: service_completed_successfully
+
+secrets:
+  db_root_password:
+    file: {{ base_dir }}/mariadb/secrets/db_root_password
+{% if frappe_email_enabled | bool %}
+  mail_password:
+    file: ./secrets/mail_password
+{% endif %}
+
+volumes:
+  sites-vol:
+    external: true
+    name: erp_sites-vol
+
+  assets-vol:
+    external: true
+    name: erp_assets-vol
+
+networks:
+  erp_default:
+    external: true
+  erp-db:
+    name: erp-db
+    external: true
+  erp-cache:
+    name: erp-cache
+    external: true
+  traefik-public:
+    external: true

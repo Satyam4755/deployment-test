@@ -1,0 +1,8 @@
+# ERP deploy configuration — rendered to /etc/erp/deploy.conf with mode 0600.
+# This file is read by erp-deploy and erp-smoke scripts.
+APP_DIR="{{ base_dir }}/erp"
+SITE_NAME="{{ site_name }}"
+DOMAIN="{{ domain }}"
+ENVIRONMENT="{{ env_name }}"
+COMPOSE_PROJECT="erp"
+COMPOSE_FILE="{{ base_dir }}/erp/compose.yaml"

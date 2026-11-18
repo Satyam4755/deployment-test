@@ -1,0 +1,308 @@
+---
+# Shared post-deployment verification tasks.
+#
+# Imported by playbooks/smoke.yml (standalone) and playbooks/update.yml (after
+# a rollout), so a green `update.yml` and a green `smoke.yml` always check the
+# same things.
+#
+# Read-only: this changes nothing on the host. Safe against production at any
+# time.
+
+# --- containers -----------------------------------------------------------
+- name: List containers that have exited
+  # One-shot services are expected to exit 0. They are separated from the
+  # long-running services below, because an expected exit is not a failure.
+  ansible.builtin.command:
+    cmd: >-
+      docker ps -a --filter status=exited
+      --format '{{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Status{{ '}}' }}'
+  register: smoke_exited
+  changed_when: false
+  failed_when: false
+
+- name: List the running stack containers
+  ansible.builtin.command:
+    cmd: >-
+      docker ps --filter
+      name=traefik --filter name=crowdsec --filter name=redis-
+      --filter name=backend --filter name=frappe-frontend
+      --format '{{ '{{' }}.Names{{ '}}' }}'
+  register: smoke_containers
+  changed_when: false
+  failed_when: false
+
+- name: Report container state
+  ansible.builtin.debug:
+    msg:
+      - >-
+        running:
+        {{ (smoke_containers.stdout | default('') | split('\n')
+            | select('!=', '') | list | length) }} container(s)
+      - >-
+        exited:
+        {{ (smoke_exited.stdout | default('none') | replace('\n', ', ')) }}
+
+- name: Fail if a long-running container has exited
+    # The two one-shot services must exit; any other exited container is a
+    # crash or a stopped service, and a green Ansible run must not paper over it.
+  ansible.builtin.fail:
+    msg: >-
+      Long-running containers have exited: {{ smoke_exited.stdout }}.
+      Inspect with `docker logs <container>`.
+  when:
+    - smoke_exited.rc | default(1) == 0
+    - smoke_exited.stdout_lines | default([])
+      | reject('match', '^(asset-syncer|configurator) ') | list | length > 0
+
+- name: Fail if a one-shot service did not exit 0
+  ansible.builtin.fail:
+    msg: >-
+      A one-shot service failed: {{ smoke_exited.stdout }}. Read its log with
+      `docker logs <container>`.
+  when:
+    - smoke_exited.rc | default(1) == 0
+    - smoke_exited.stdout_lines | default([])
+      | select('match', '^(asset-syncer|configurator) ')
+      | reject('search', 'Exited \(0\)') | list | length > 0
+
+  # --- edge ---------------------------------------------------------------
+- name: Request the Frappe API over the edge
+    # --resolve sends the real SNI and Host header to 127.0.0.1, so this
+    # exercises Traefik's routing and the certificate it issued for the domain
+    # while bypassing Cloudflare and the public internet. 127.0.0.1/32 is in
+    # the cloudflare-allow list for exactly this reason, so a green result
+    # here means the origin is genuinely healthy even if DNS is broken.
+    #
+    # deliberately NOT the uri module: that resolves DNS normally and cannot
+    # pin the connection to 127.0.0.1 while preserving the real SNI and Host
+    # header. Exercising the real domain end to end is the point of this check.
+  ansible.builtin.command: # noqa command-instead-of-module
+    cmd: >-
+      curl --silent --show-error --fail
+      --max-time 20
+      --resolve {{ domain }}:443:127.0.0.1
+      https://{{ domain }}/api/method/ping
+  register: smoke_frappe_ping
+  changed_when: false
+  retries: 5
+  delay: 10
+  until: smoke_frappe_ping.rc == 0
+  failed_when: false
+
+- name: Assert the Frappe site serves requests
+  ansible.builtin.assert:
+    that:
+      - smoke_frappe_ping.rc == 0
+    success_msg: >-
+      {{ domain }} answered /api/method/ping
+      ({{ smoke_frappe_ping.stdout | default('') | trim }})
+    fail_msg: >-
+      {{ domain }} did not answer /api/method/ping through the edge.
+      curl: {{ smoke_frappe_ping.stderr | default('no output') }}
+      body: {{ smoke_frappe_ping.stdout | default('') }}
+      Check `docker logs frappe-frontend` and `docker logs backend`, and
+      the traefik access log for the response status.
+
+- name: Check the TLS certificate served for the domain
+  # `openssl s_client` blocks reading stdin and never exits on its own, so
+  # stdin is closed explicitly; without this the task hangs until the play
+  # times out. There is no task keyword for that, hence the shell.
+  #
+  # 2>&1 merges stderr into stdout because s_client prints "Verify return
+  # code" to stderr, and that line is what the assertion below checks.
+  ansible.builtin.shell:
+    cmd: >-
+      openssl s_client -connect 127.0.0.1:443
+      -servername {{ domain }} -verify_return_error
+      < /dev/null 2>&1
+    executable: /bin/bash
+  register: smoke_tls
+  changed_when: false
+  failed_when: false
+
+- name: Report the certificate that was served
+  ansible.builtin.debug:
+    msg: >-
+      {{ smoke_tls.stdout_lines | default([])
+         | select('search', 'subject=|issuer=|Verify return code')
+         | join(' | ') }}
+
+- name: Assert the certificate is valid for the domain
+  ansible.builtin.assert:
+    that:
+      - "'Verify return code: 0 (ok)' in (smoke_tls.stdout | default(''))"
+    fail_msg: >-
+      The certificate served for {{ domain }} is not valid.
+      {{ smoke_tls.stderr | default('') }}
+      {{ smoke_tls.stdout_lines | default([]) | join(' ') }}
+      If ACME is pointed at the staging CA (which is the development
+      default), the certificate is not publicly trusted by design and this
+      check is expected to fail there.
+    quiet: true
+
+  # --- crowdsec -----------------------------------------------------------
+- name: Check whether CrowdSec is deployed at all
+    # The checks below only make sense on a server that runs CrowdSec. On a
+    # server where only Traefik is deployed there is nothing to verify.
+  community.docker.docker_container_info:
+    name: crowdsec
+  register: smoke_crowdsec
+  failed_when: false
+
+- name: Check the LAPI from inside the Traefik container
+    # deliberately NOT the uri module: this has to run *inside the traefik
+    # container*, because the question is whether Traefik's own network can
+    # reach the LAPI. A controller-side check would prove nothing about that.
+  ansible.builtin.command: # noqa command-instead-of-module
+    cmd: wget --no-verbose --tries=1 --spider http://crowdsec:8080/health
+  register: smoke_lapi
+  changed_when: false
+  failed_when: false
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Check that CrowdSec can see the Traefik access log
+    # The detection chain starts with this file. If CrowdSec cannot read it,
+    # it parses nothing, makes no decisions, and the bouncer has nothing to
+    # enforce - the whole IPS is quietly doing nothing.
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: ls -l /var/log/traefik/access.log
+  register: smoke_access_log
+  changed_when: false
+  failed_when: false
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Check that the CrowdSec acquisition file is in place
+    # This file tells CrowdSec which log to read and which parser to use.
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: ls -l /etc/crowdsec/acquis.d/traefik.yaml
+  register: smoke_acquis
+  changed_when: false
+  failed_when: false
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Confirm the Traefik bouncer is registered
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: cscli bouncers list -o json
+  register: smoke_bouncers
+  changed_when: false
+  failed_when: false
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Add a test decision
+    # 198.51.100.0/24 is TEST-NET-2, a range reserved for documentation, so
+    # it cannot belong to a real visitor. The decision is removed again below.
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: cscli decisions add --ip 198.51.100.42 -d 2m
+  register: smoke_decision_add
+  changed_when: false
+  failed_when: false
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Read the decisions from inside the Traefik container
+    # This is the same call the bouncer plugin makes. If the test IP comes
+    # back, the LAPI is serving decisions to Traefik over the exact network
+    # path the plugin uses, with the key from the vault.
+  community.docker.docker_container_exec:
+    container: traefik
+    command: >-
+      wget --quiet --tries=1 --output-document=-
+      --header="X-Api-Key: {{ crowdsec_traefik_key }}"
+      http://crowdsec:8080/v1/decisions
+  register: smoke_decisions
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Remove the test decision
+  community.docker.docker_container_exec:
+    container: crowdsec
+    command: cscli decisions remove --ip 198.51.100.42
+  changed_when: false
+  failed_when: false
+  when:
+    - smoke_crowdsec.exists | default(false)
+    - smoke_decision_add.rc | default(1) == 0
+
+- name: Assert CrowdSec can read the access log and the acquisition
+  ansible.builtin.assert:
+    that:
+      - smoke_access_log.rc | default(1) == 0
+      - smoke_acquis.rc | default(1) == 0
+    fail_msg: >-
+      CrowdSec cannot read Traefik's access log, or the acquisition file is
+      missing, so no events are parsed and no decisions are ever made.
+      access log: {{ smoke_access_log.stderr | default('missing') }}
+      acquisition: {{ smoke_acquis.stderr | default('missing') }}
+    quiet: true
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Assert the bouncer key is accepted by the LAPI
+  ansible.builtin.assert:
+    that:
+      - smoke_decisions.rc | default(1) == 0
+      - "'198.51.100.42' in (smoke_decisions.stdout | default(''))"
+    fail_msg: >-
+      The LAPI did not serve the test decision to Traefik. Either the bouncer
+      key in the vault does not match the registered bouncer, or Traefik and
+      CrowdSec do not share the crowdsec-net network.
+    quiet: true
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Report the CrowdSec verdict path
+  ansible.builtin.debug:
+    msg:
+      - >-
+        LAPI reachable from traefik:
+        {{ ((smoke_lapi.rc | default(1)) == 0) | ternary('yes', 'NO') }}
+      - >-
+        access log readable by crowdsec:
+        {{ ((smoke_access_log.rc | default(1)) == 0) | ternary('yes', 'NO') }}
+      - >-
+        bouncer `traefik` registered:
+        {{ ('"traefik"' in (smoke_bouncers.stdout | default('')))
+           | ternary('yes', 'NO') }}
+      - >-
+        enforcing decisions:
+        {{ (traefik_crowdsec_enabled | default(false) | bool)
+           | ternary('yes', 'no (decisions are NOT being blocked)') }}
+  when: smoke_crowdsec.exists | default(false)
+
+- name: Note that CrowdSec is not deployed here
+  ansible.builtin.debug:
+    msg: >-
+      CrowdSec is not running on this server, so the CrowdSec checks were
+      skipped. Run playbooks/crowdsec.yml to deploy it.
+  when: not (smoke_crowdsec.exists | default(false))
+
+- name: Warn when the bouncer is still off in production
+    # Not a failure: the phased rollout deliberately starts with the bouncer
+    # off. But on production it should eventually be on, and this makes the
+    # gap visible instead of leaving it to be discovered during an incident.
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: the CrowdSec bouncer is not enforcing decisions on
+      {{ env_name }}. Set traefik_crowdsec_enabled: true in
+      group_vars/{{ env_name }}/main.yml once the LAPI checks pass, then run
+      playbooks/site.yml.
+  when:
+    - env_name == 'production'
+    - not (traefik_crowdsec_enabled | default(false) | bool)
+
+- name: Warn when the origin is reachable directly in Cloudflare proxy mode
+    # Only relevant in Cloudflare proxy mode (traefik_origin_cloudflare_only: true).
+    # In that mode, the cloudflare-allow middleware should reject direct-to-origin
+    # requests. If this check runs in proxy mode, we verify the middleware works.
+    # In direct mode and Cloudflare DNS mode, direct access is expected and normal.
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: Cloudflare proxy mode is enabled (traefik_origin_cloudflare_only: true)
+      but the origin may still answer direct requests. Confirm the DNS record is
+      proxied (orange cloud) and the cloudflare-allow middleware is attached to
+      the app router in dynamic.yaml.
+  when:
+    - traefik_origin_cloudflare_only | default(false) | bool

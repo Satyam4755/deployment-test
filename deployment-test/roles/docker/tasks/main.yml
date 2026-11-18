@@ -1,0 +1,170 @@
+---
+# Install Docker from Docker's official repository (never distro Docker, which
+# lags behind on Compose v2 and the buildx plugin this stack needs).
+
+- name: Install Docker repository prerequisites
+  ansible.builtin.apt:
+    name: "{{ docker_apt_dependencies }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [docker]
+
+- name: Configure the Docker apt repository
+  tags: [docker]
+  block:
+    - name: Ensure the apt keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Install the Docker signing key
+      # key_mode: yes writes the ASCII-armoured key in the format apt's
+      # `signed-by=` expects, so no `apt-key` and no deprecation warnings.
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg
+        dest: "{{ docker_apt_keyring }}"
+        mode: '0644'
+
+    - name: Add the Docker apt source
+      ansible.builtin.copy:
+        dest: "{{ docker_apt_repository }}"
+        mode: '0644'
+        content: |
+          # Managed by Ansible (roles/docker).
+          {{ 'deb [signed-by=' ~ docker_apt_keyring
+             ~ '] https://download.docker.com/linux/'
+             ~ (ansible_distribution | lower) ~ ' '
+             ~ ansible_distribution_release ~ ' stable' }}
+
+    - name: Refresh the apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+- name: Install Docker Engine and Compose v2
+  ansible.builtin.apt:
+    name: "{{ docker_apt_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [docker]
+
+- name: Apply daemon hardening
+  # NOTE: daemon.json is strict JSON and has no comment syntax, so the
+  # rendered file carries no `#` annotations. Anything written into `content`
+  # here must parse as JSON or Docker refuses to start.
+  #
+  # This is host-level hardening only. The per-service hardening that actually
+  # constrains the Frappe and Traefik containers (read_only, cap_drop,
+  # security_opt, resource limits) lives in the compose files.
+  #
+  # Deliberately NOT set, each needing a migration rather than a config
+  # toggle:
+  #   icc: false            breaks container-to-container traffic on the
+  #                          default bridge
+  #   userland-proxy: false changes how published ports are handled
+  #   userns-remap          orphans the ownership of every existing named
+  #                          volume (sites-vol, assets-vol, mariadb-data) and
+  #                          breaks the stack until each is chowned
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      {{ docker_daemon_options | to_nice_json(indent=2) }}
+    # A malformed daemon.json stops Docker starting at all, which on a Docker
+    # host means every container stays down. This runs against the staged file
+    # before it replaces the working config.
+    validate: python3 -c "import json,sys; json.load(open('%s'))"
+  notify: Restart docker
+  tags: [docker, docker-daemon]
+
+- name: Ensure the Docker service is enabled and running
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+  tags: [docker]
+
+- name: Apply DOCKER-USER firewall rules after Docker starts
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/apply-docker-user-rules
+  failed_when: false
+  changed_when: false
+  tags: [docker, firewall]
+
+- name: Grant the deploy owner access to the Docker socket
+  # Scoped to an explicit list. The Ansible login user is intentionally
+  # absent — see the warning in defaults/main.yml.
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_socket_groups }}"
+  loop_control:
+    label: "{{ item }}"
+  tags: [docker, docker-socket]
+
+- name: Reclaim disk from superseded images
+  # The stack roles pull on every run, so each version bump leaves the old
+  # image behind. Without this the root filesystem fills and takes MariaDB
+  # down with it. The 168h floor keeps a rollback target available.
+  when:
+    - docker_prune_enabled | bool
+    - not ansible_check_mode
+  tags: [docker, docker-prune]
+  block:
+    - name: Remove images unused for longer than the retention window
+      # The CLI is used deliberately here: community.docker.docker_image's
+      # prune mode has no age filter, so it cannot honour the retention
+      # window. `until` is what makes the "a rollback target always exists"
+      # property real — without it, `--all` would remove the previous
+      # release's image the moment a new version is deployed, leaving no way
+      # back without re-pulling.
+      ansible.builtin.command:
+        cmd: >-
+          docker image prune --all --force
+          --filter "until={{ docker_prune_images_after }}"
+      register: docker_prune_result
+      # The CLI reports "Total reclaimed space: 0B" when there was nothing to
+      # remove; anything else means it reclaimed space and the host changed.
+      changed_when: >-
+        'Total reclaimed space: 0B'
+        not in (docker_prune_result.stdout | default(''))
+
+    - name: Remove containers stopped for longer than the retention window
+      # Never touches running containers. `--filter until` also keeps the
+      # container of a rolled-back service around for the same reason.
+      ansible.builtin.command:
+        cmd: >-
+          docker container prune --force
+          --filter "until={{ docker_prune_images_after }}"
+      register: docker_container_prune
+      changed_when: >-
+        'Total reclaimed space: 0B'
+        not in (docker_container_prune.stdout | default(''))
+
+    - name: Report reclaimed space
+      ansible.builtin.debug:
+        msg: >-
+          Docker housekeeping removed images and containers unused for
+          longer than {{ docker_prune_images_after }}.
+          {{ docker_prune_result.stdout_lines | default([]) | last | default('') }}
+
+- name: Verify the Docker and Compose toolchain
+  # Plain output rather than `docker version --format '{{.Server.Version}}'`:
+  # that Go template contains Jinja-invalid braces, and escaping it is less
+  # readable than just printing both the client and server versions.
+  ansible.builtin.command:
+    cmd: "{{ item }}"
+  loop:
+    - "docker --version"
+    - "docker compose version --short"
+  loop_control:
+    label: "{{ item }}"
+  register: docker_version_check
+  changed_when: false
+  failed_when: docker_version_check.rc != 0
+  tags: [docker]

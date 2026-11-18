@@ -1,0 +1,31 @@
+---
+# ansible-lint configuration.
+#
+# Run with: ansible-lint            (CI uses --profile production)
+exclude_paths:
+  - .git/
+  - .opencode/
+  - .venv/
+  # The production vault cannot be decrypted during a lint run, and a secret
+  # store is not configuration to be style-checked in the first place.
+  - group_vars/production/vault.yml
+  # Example vaults are data fixtures, not playbooks or role variables. CI
+  # copies them over the real vaults before linting; scanning them as
+  # configuration only produces false positives.
+  - examples/
+
+skip_list:
+  # Shared configuration in group_vars/all deliberately does not carry a role
+  # prefix. Prefixing `tz` as `traefik_tz` would be actively misleading: the
+  # same value configures Traefik log timestamps, the crowdsec container,
+  # Frappe, and the host's own timezone. The single-source-of-truth property
+  # in group_vars/all is worth more than per-role namespacing, and it is the
+  # mechanism that keeps development and production from drifting.
+  - var-naming[no-role-prefix]
+
+warn_list:
+  # `changed_when: true` on the Frappe cache-clear and restart tasks is
+  # intentional: clearing the cache and restarting containers genuinely does
+  # change the running system on every deploy, and reporting them as unchanged
+  # would make --check misrepresent what a deploy does.
+  - no-changed-when

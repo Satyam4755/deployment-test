@@ -1,0 +1,99 @@
+---
+# Objective 1: take a raw Ubuntu 24.04 server to a hardened host.
+#
+# Run this BEFORE playbooks/traefik.yml. Nothing else can work until Docker is
+# installed and the access model exists.
+#
+# Bootstrap vs. steady state
+# -------------------------
+# This playbook is unusual in that it is normally run as root, not through the
+# two-layer model it creates:
+#
+#   FIRST RUN (bootstrap) — you need some way in, usually provider console
+#   access as root:
+#     ansible-playbook -i inventory/inventory.yml \
+#       --limit development -e target_env=development \
+#       -e ansible_user=root -e ansible_become_user=root \
+#       playbooks/server.yml
+#
+#   EVERY RUN AFTERWARDS — the model this playbook created:
+#     ansible-playbook -i inventory/inventory.yml \
+#       --limit development -e target_env=development \
+#       --vault-id dev@/tmp/vault_pass \
+#       --become-password-file /tmp/become_pass \
+#       --private-key ~/.ssh/id_deploy playbooks/server.yml
+#
+# Ansible connects as the admin account, then escalates to root with that
+# admin's own sudo password. See roles/base/defaults/main.yml for the rationale.
+#
+# Re-running is safe: every task is idempotent. SSH hardening in particular is
+# written to be re-applied, so running this twice does not lock you out.
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Harden the host and install Docker
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - role: base
+    - role: docker
+
+- name: Report the resulting security posture
+  # A read-back, so a run that "succeeded" is visibly different from a run
+  # that did nothing. Cheap, and catches a playbook that quietly no-opped.
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the UFW status
+      ansible.builtin.command:
+        cmd: ufw status verbose
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Read the login user's group memberships
+      ansible.builtin.command:
+        cmd: id -nG {{ base_ssh_login_user | default(ansible_user) }}
+      register: base_login_groups
+      changed_when: false
+
+    - name: Fail if the login user can reach the Docker socket
+      # Final backstop on the one invariant that cannot be expressed in the
+      # role: docker-group membership silently equals root and would make the
+      # entire two-layer access model decorative.
+      ansible.builtin.fail:
+        msg: >-
+          {{ base_ssh_login_user | default(ansible_user) }} is a member of the docker group. That is
+          equivalent to root and defeats the second access layer. Remove it
+          with: gpasswd -d {{ base_ssh_login_user | default(ansible_user) }} docker
+      when: "'docker' in base_login_groups.stdout.split()"
+
+    - name: Validate the effective sshd configuration
+      # The base role validates during its handler, but handlers only run when
+      # a change occurred. This read-only check makes the summary independent
+      # of whether this run changed anything.
+      ansible.builtin.command:
+        cmd: /usr/sbin/sshd -t
+      register: base_sshd_check
+      changed_when: false
+      failed_when: false
+
+    - name: Read the effective sshd configuration
+      ansible.builtin.command:
+        cmd: /usr/sbin/sshd -T
+      register: base_sshd_effective
+      changed_when: false
+      failed_when: false
+
+    - name: Summarise the hardened state
+      ansible.builtin.debug:
+        msg:
+          - "environment: {{ env_name }}"
+          - "sshd config valid: {{ 'yes' if (base_sshd_check.rc | default(1)) == 0 else 'NO' }}"
+          - "root login permitted: {{ 'YES - FIX THIS' if 'permitrootlogin yes' in (base_sshd_effective.stdout | default('')) else 'no' }}"
+          - "password auth permitted: {{ 'YES - FIX THIS' if 'passwordauthentication yes' in (base_sshd_effective.stdout | default('')) else 'no' }}"
+          - "ufw: {{ (ufw_status.stdout_lines | default(['unknown'])) | join(' | ') }}"
+          - "docker-socket access: {{ (docker_socket_groups | default(['deployowner'])) | join(', ') }}"
+          - "login user docker access: {{ ('docker' in base_login_groups.stdout.split()) | ternary('YES - FIX THIS', 'no') }}"

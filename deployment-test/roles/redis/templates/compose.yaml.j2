@@ -1,0 +1,57 @@
+---
+# Redis instances for the Frappe bench (cache / queue).
+# Internal network only — never published. Pinned image, healthchecked so
+# dependents can use `condition: service_healthy`.
+# 
+# Following upstream Frappe two-instance layout:
+# - redis-cache: disposable, no persistent volume
+# - redis-queue: persistent volume for RQ jobs; Socket.IO pub/sub uses same endpoint
+services:
+  redis-cache:
+    image: {{ redis_image | default('redis:8.6-alpine') }}
+    container_name: redis-cache
+    restart: unless-stopped
+    command: ["redis-server", "--save", "900", "1", "--appendonly", "no"]
+    # No persistent volume - cache is disposable
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - erp-cache
+
+  redis-queue:
+    image: {{ redis_image | default('redis:8.6-alpine') }}
+    container_name: redis-queue
+    restart: unless-stopped
+    command: ["redis-server", "--save", "900", "1", "--appendonly", "no"]
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - erp-cache
+
+volumes:
+  redis-queue-data:
+
+networks:
+  erp-cache:
+    name: erp-cache
+    external: true

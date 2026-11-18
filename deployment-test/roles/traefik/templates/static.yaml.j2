@@ -1,0 +1,79 @@
+# ============================================================================== # file header; identifies Traefik v3 hardened static config
+# Traefik v3 Static Configuration (Hardened / frappe+crowdsec only) # title; scope limited to edge + security + ERP
+# ============================================================================== # header close
+global: # global daemon settings
+  sendAnonymousUsage: false # disable telemetry phone-home; privacy + egress hygiene
+ping: {} # enable ping handler for `traefik healthcheck --ping`; no entryPoint pin avoids missing-entrypoint crash
+api: # internal management API block
+  dashboard: true # enable Web UI; exposed only via websecure router with auth, never insecure
+  debug: false # disable debug; reduces log bloat + attack surface in production
+  insecure: false # forbid unauthenticated :8080 exposure
+entryPoints: # ingress listeners block
+  web: # http listener name
+    address: ":80" # bind all interfaces port 80; host mode preserves IP; redirect below upgrades
+    http: # http options
+      redirections: # universal upgrade block
+        entryPoint: # entrypoint redirect stanza
+          to: websecure # redirect target https listener
+          scheme: https # upgrade scheme
+          permanent: true # 301; cacheable + SEO-safe
+  websecure: # https listener name; NO middlewares here per decision (router-level only)
+    address: ":443" # bind all interfaces 443; edge exception documented in compose
+    http: # http options
+      tls: {} # enable TLS; per-router certresolver supplies certs
+    forwardedHeaders: # real-IP handling block
+      trustedIPs: # only these may set X-Forwarded-For; Traefik strips that header for anybody else, so a client cannot forge its own IP
+{% for ip in traefik_trusted_ips | default([]) %}
+        - "{{ ip }}" # Cloudflare edge range or loopback
+{% endfor %}
+providers: # dynamic discovery block
+  docker: # docker provider stanza
+    exposedByDefault: false # require traefik.enable=true; prevents accidental exposure
+    network: traefik-public # force routing via edge bridge, not internal nets
+    endpoint: "tcp://socket-proxy:2375" # via sidecar filter; never mount sock directly in traefik
+  file: # file provider stanza
+    directory: /etc/traefik/dynamic # modular dir; watches config.yaml
+    watch: true # hot-reload on config change without restart
+certificatesResolvers: # ACME automation block
+  http: # resolver name referenced by routers as `http` (for direct mode)
+    acme: # ACME stanza
+      caServer: "{{ acme_server | default('https://acme-v02.api.letsencrypt.org/directory') }}"
+      email: "{{ cloudflare_email }}"
+      storage: /etc/traefik/acme/acme.json # absolute path in traefik-acme volume; must persist
+      httpChallenge: # HTTP-01 block; used in direct mode
+        entryPoint: web # HTTP-01 challenge comes in on port 80
+  cloudflare: # resolver name referenced by routers as `cloudflare`
+    acme: # ACME stanza
+      caServer: "{{ cloudflare_acme_server }}" # prod https://acme-v02... or staging for testing
+      email: "{{ cloudflare_email }}" # LE account contact; renewal notices
+      storage: /etc/traefik/acme/acme.json # absolute path in traefik-acme volume; must persist
+      dnsChallenge: # DNS-01 block; only method behind Cloudflare proxy
+        provider: cloudflare # lego provider; uses CF_DNS_API_TOKEN env
+        resolvers: # propagation check resolvers
+          - "1.1.1.1:53" # Cloudflare DNS
+          - "1.0.0.1:53" # Cloudflare secondary
+log: # daemon operational logging
+  level: "{{ traefik_log_level | default('INFO') }}" # DEBUG in development, INFO in production
+  filePath: "/var/log/traefik/traefik.log" # path in traefik-logs volume; shared ro with crowdsec
+accessLog: # edge access logging; FULL logs required for CrowdSec stream mode (no statusCodes filter)
+  filePath: "/var/log/traefik/access.log" # path in traefik-logs volume
+  format: json # structured for crowdsec parser crowdsecurity/traefik
+  bufferingSize: 0 # disable buffering; immediate flush for stream decisions
+  fields: # header capture hygiene
+    headers: # header stanza
+      defaultMode: drop # drop all by default; privacy
+      names: # allowlist
+        user-agent: keep # needed for bot/cve detection
+        cf-ray: keep # Cloudflare request correlation
+        cf-connecting-ip: keep # true client IP behind CF
+        x-forwarded-for: keep # fallback real-IP chain
+{% if traefik_crowdsec_enabled | default(false) %}
+experimental: # plugin catalog block (only when CrowdSec bouncer enabled)
+  plugins: # plugin map
+    crowdsec-bouncer-traefik-plugin: # bouncer name referenced as middleware plugin
+      moduleName: "{{ traefik_bouncer_plugin }}" # upstream module
+      version: "{{ traefik_bouncer_version }}" # pinned version; must exist in the Traefik plugin registry or Traefik will not start
+      # No `path` here: Traefik v3 does not have such an option. It always
+      # downloads plugins into ./plugins-storage/ relative to the container's
+      # working directory, which is why the compose file mounts a tmpfs there.
+{% endif %}

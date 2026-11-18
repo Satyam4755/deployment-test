@@ -1,0 +1,207 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json # enables compose JSON-schema validation in editors
+services: # service topology root; declares runtime containers
+  log-volume-init: # one-shot helper; makes the shared log volume writable by Traefik
+    image: {{ traefik_image | default('traefik:v3.7.13') }} # same image, so no extra pull
+    container_name: traefik-log-init # deterministic name for logs
+    restart: "no" # runs once and exits
+    user: "0:0" # must be root: Docker creates a named volume as root:root 0755, and Traefik runs as 65532
+    entrypoint: ["/bin/sh", "-c", "chown {{ traefik_uid | default('65532') }}:{{ traefik_gid | default('65532') }} /var/log/traefik && chmod 0755 /var/log/traefik"] # hand the volume to the Traefik user
+    read_only: true # ro rootfs; this container only chowns one directory
+    cap_drop: # least-privilege block
+      - ALL # drop everything, then add back only what chown needs
+    cap_add:
+      - CHOWN # change the owner of the log directory
+      - FOWNER # change its mode
+    security_opt:
+      - "no-new-privileges:true" # blocks setuid escalation
+    network_mode: none # no network needed to chown a directory
+    volumes:
+      - type: volume # the shared log volume
+        source: traefik-logs
+        target: /var/log/traefik
+  acme-volume-init: # one-shot helper; prepares acme.json with strict permissions
+    image: {{ traefik_image | default('traefik:v3.7.13') }} # same image, so no extra pull
+    container_name: traefik-acme-init # deterministic name for logs
+    restart: "no" # runs once and exits
+    user: "0:0" # must be root: Docker creates a named volume as root:root 0755, and Traefik runs as 65532
+    entrypoint: ["/bin/sh", "-c", "touch /etc/traefik/acme/acme.json && chmod 0600 /etc/traefik/acme/acme.json && chown {{ traefik_uid | default('65532') }}:{{ traefik_gid | default('65532') }} /etc/traefik/acme /etc/traefik/acme/acme.json"] # create and protect acme.json
+    read_only: true # ro rootfs; this container only initializes the acme volume
+    cap_drop: # least-privilege block
+      - ALL # drop everything, then add back only what chown/chmod/create needs
+    cap_add:
+      - CHOWN # change the owner of the acme directory and acme.json
+      - FOWNER # change file permissions
+      - DAC_OVERRIDE # permit file creation/chmod across unprivileged volume owners
+    security_opt:
+      - "no-new-privileges:true" # blocks setuid escalation
+    network_mode: none # no network needed to initialize volume
+    volumes:
+      - type: volume # the persistent acme volume
+        source: traefik-acme
+        target: /etc/traefik/acme
+  traefik: # edge reverse proxy + TLS termination; sole ingress from internet for frappe/crowdsec stack
+    image: {{ traefik_image | default('traefik:v3.7.13') }} # pinned immutable tag; prevents upstream breaking changes
+    container_name: traefik # deterministic name; simplifies DNS/logs/exec
+    restart: unless-stopped # auto-recover on daemon reboot; manual stop respected
+    read_only: true # ro rootfs; blocks runtime malware writes
+    security_opt: # privilege hardening block
+      - "no-new-privileges:true" # blocks setuid/setgid escalation vectors
+    cap_drop: # least-privilege block
+      - ALL # drop all kernel caps; none re-added for edge proxy
+    user: "{{ traefik_uid | default('65532') }}:{{ traefik_gid | default('65532') }}" # run as unprivileged nobody built into traefik alpine
+    sysctls: # kernel tweaks for unprivileged bind
+      - net.ipv4.ip_unprivileged_port_start=0 # allow UID 65532 to bind 80/443 inside netns
+    depends_on: # ordering block
+      log-volume-init: # the log volume must be writable before Traefik starts
+        condition: service_completed_successfully # wait for the one-shot chown to finish
+      acme-volume-init: # acme.json must exist with 0600 permissions before Traefik starts
+        condition: service_completed_successfully
+    deploy: # resource isolation block
+      resources: # swarm/compose resource stanza
+        limits: # hard caps; protects host from exhaustion
+          cpus: "{{ traefik_cpus_limit | default('1.00') }}" # max vCPU (env-specific)
+          memory: {{ traefik_memory_limit | default('512M') }} # max RAM
+        reservations: # guaranteed slice
+          cpus: "0.20" # guaranteed CPU
+          memory: 128M # guaranteed RAM
+    tmpfs: # ephemeral memory mounts; no disk writes
+      - /tmp:rw,noexec,nosuid,nodev,size=64M # scratch; noexec blocks binary exec
+      - /var/run:rw,noexec,nosuid,nodev,size=16M # pid sockets; isolated
+      - /var/cache:rw,noexec,nosuid,nodev,size=32M # plugin cache; isolated
+      # Traefik downloads plugins into ./plugins-storage/, relative to the
+      # container's working directory. The image has no WORKDIR, so that is
+      # /plugins-storage. The root filesystem is read_only, so without this
+      # writable mount the bouncer plugin cannot be unpacked and Traefik
+      # refuses to start. `noexec` is safe: Yaegi interprets the plugin, it
+      # is not executed as a binary.
+      - /plugins-storage:rw,noexec,nosuid,nodev,size=64M,mode=1777
+    networks: # segmentation block
+      traefik-public: null # edge bridge to frappe-frontend; external
+      docker-proxynet: null # backchannel to socket-proxy; internal only
+      crowdsec-net: null # private link to crowdsec; the app containers are not on it
+    ports: # EDGE EXCEPTION: must be 0.0.0.0 to receive internet; backends use no published ports
+      - target: 80 # container http listener
+        published: 80 # host http; internet -> host:80 -> traefik
+        protocol: tcp # l4 protocol
+        mode: host # Swarm-only setting; Compose ignores it. Docker's own port forwarding keeps the client IP, which is what CrowdSec needs
+      - target: 443 # container https listener
+        published: 443 # host https; internet -> host:443 -> traefik
+        protocol: tcp # l4 protocol
+        mode: host # same as above; kept so a Swarm deployment behaves the same
+    environment: # runtime injection; secrets never hardcoded
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN:-} # Cloudflare DNS-01 for LE automation; only set in Cloudflare modes
+      - TZ=${TZ:-UTC} # log timestamps; IANA tz identifier
+    volumes: # storage isolation block
+      - type: bind # static core config mount
+        source: ./configs/traefik.yaml # host static file; templated by ansible static.yaml.j2
+        target: /etc/traefik/traefik.yaml # container static path
+        read_only: true # mandatory ro; prevents runtime tampering of proxy params
+      - type: bind # dynamic routers/middlewares mount
+        source: ./configs/config.yaml # host dynamic file; templated by ansible dynamic.yaml.j2
+        target: /etc/traefik/dynamic/config.yaml # file provider directory path
+        read_only: true # mandatory ro; rules immutable from inside container
+      - type: volume # ACME keys/certs persistence
+        source: traefik-acme # named volume; survives container recreate
+        target: /etc/traefik/acme # must stay writable for ACME renewal payloads
+      - type: volume # log sink shared ro with crowdsec
+        source: traefik-logs # named volume
+        target: /var/log/traefik # traefik.log + access.log output here
+    secrets: # file-backed Compose secrets; the engine mounts them 0444 root-owned
+      - crowdsec_lapi_key # /run/secrets/crowdsec_lapi_key
+      - dashboard_users # /run/secrets/dashboard_users
+    healthcheck: # liveness for orchestrator
+      test: ["CMD", "traefik", "healthcheck", "--ping"] # uses ping.enabled in static config
+      interval: 10s # probe cadence
+      timeout: 3s # per-probe timeout
+      retries: 3 # failures before unhealthy
+      start_period: 5s # grace period on boot
+    logging: # disk protection block
+      driver: "json-file" # default log driver
+      options: # rotation options
+        max-size: "10m" # per-file cap
+        max-file: "3" # file count cap
+    labels: # dashboard router; operated via traefik itself
+      - "traefik.enable=true" # explicit enable; exposedByDefault=false so required
+      - "traefik.docker.network=traefik-public" # force routing via public net
+      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DASHBOARD_HOST:?TRAEFIK_DASHBOARD_HOST is mandatory}`)" # dashboard hostname from env
+      - "traefik.http.routers.dashboard.entrypoints=websecure" # https only; no http
+      - "traefik.http.routers.dashboard.tls=true" # enable TLS on router
+      - "traefik.http.routers.dashboard.tls.certresolver=${TRAEFIK_CERT_RESOLVER}" # LE via http or cloudflare resolver
+      - "traefik.http.routers.dashboard.service=api@internal" # built-in api service
+{% if traefik_crowdsec_enabled | default(false) %}
+      - "traefik.http.routers.dashboard.middlewares=crowdsec-bouncer@file,dashboard-allow@file,dashboard-auth@docker,rate-limit-default@file,security-headers@file" # bouncer first; private allowlist before auth; no cloudflare-allow on dashboard
+{% else %}
+      - "traefik.http.routers.dashboard.middlewares=dashboard-allow@file,dashboard-auth@docker,rate-limit-default@file,security-headers@file" # private allowlist before auth; router-level only, nothing on entrypoint
+{% endif %}
+      - "traefik.http.middlewares.dashboard-auth.basicauth.usersfile=/run/secrets/dashboard_users" # per-admin basic auth from Compose secret
+  socket-proxy: # SIDECAR EXCEPTION: docker socket guardian; not an app service; single allowed exception to single-service rule
+    image: {{ socket_proxy_image | default('lscr.io/linuxserver/socket-proxy:latest') }} # pinned filter proxy release
+    container_name: socket-proxy # deterministic for tcp://socket-proxy:2375 upstream
+    restart: unless-stopped # auto-recover on reboot
+    read_only: true # ro rootfs; blocks binary alteration
+    security_opt: # hardening block
+      - "no-new-privileges:true" # blocks escalation inside proxy
+    cap_drop: # least-priv block
+      - ALL # drop all kernel caps
+    tmpfs: # ephemeral block
+      - /run:rw,noexec,nosuid,nodev,size=16M # haproxy run sockets
+      - /tmp:rw,noexec,nosuid,nodev,size=16M # scratch space
+      # Note: no /plugins-storage here. That is Traefik's mount, not the
+      # sidecar's — socket-proxy filters the Docker API and never loads a
+      # Traefik plugin. It was previously mounted on the wrong service.
+    networks: # isolated backchannel only
+      docker-proxynet: null # no external route; only traefik reaches it
+    volumes: # socket exposure confined
+      - type: bind # host daemon socket; operational necessity: service discovery without direct sock mount in traefik
+        source: /var/run/docker.sock # host engine socket
+        target: /var/run/docker.sock # proxy filters then exposes TCP 2375
+        read_only: true # mandatory ro; proxy enforces POST=0 etc. below
+    environment: # API whitelist; everything else denied by default
+      - CONTAINERS=1 # allow list/inspect for label discovery
+      - EVENTS=1 # allow event stream for instant router reload
+      - NETWORKS=1 # allow network inspect for container IP mapping
+      - POST=0 # deny all writes
+      - BUILD=0 # deny build endpoint
+      - COMMIT=0 # deny commit endpoint
+      - EXEC=0 # deny exec endpoint
+      - SECRETS=0 # deny secrets endpoint
+      - SWARM=0 # deny swarm endpoint
+    deploy: # isolation block
+      resources: # resource stanza
+        limits: # hard caps
+          cpus: "0.50" # max CPU
+          memory: 128M # max RAM
+        reservations: # guaranteed slice
+          cpus: "0.10" # guaranteed CPU
+          memory: 32M # guaranteed RAM
+    healthcheck: # listener probe
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:2375/version || exit 1"] # wget exists in linuxserver image; nc not guaranteed
+      interval: 10s # probe cadence
+      timeout: 3s # per-probe timeout
+      retries: 3 # failures to unhealthy
+      start_period: 3s # grace on boot
+    logging: # rotation block
+      driver: "json-file" # driver
+      options: # rotation opts
+        max-size: "10m" # per-file cap
+        max-file: "3" # file count cap
+volumes: # persistent topology root
+  traefik-acme: # ACME account keys + issued certs
+    name: traefik-acme # explicit name; stable across projects
+  traefik-logs: # access + daemon logs; shared ro with crowdsec for stream parsing
+    name: traefik-logs # explicit name
+secrets: # file-backed secrets; the engine copies them into the container at 0444
+  crowdsec_lapi_key:
+    file: ./secrets/crowdsec-lapi-key
+  dashboard_users:
+    file: ./secrets/dashboard-users
+networks: # network topology root
+  traefik-public: # edge bridge to frappe-frontend
+    name: traefik-public # explicit name
+    external: true # managed independently; create via docker network create traefik-public
+  docker-proxynet: # backchannel traefik <-> socket-proxy
+    name: docker-proxynet # explicit name
+    internal: true # no internet gateway; isolated
+  crowdsec-net: # private link between traefik and crowdsec
+    name: {{ traefik_crowdsec_network | default('crowdsec-net') }} # explicit name
+    external: true # created by the traefik role and by playbooks/site.yml

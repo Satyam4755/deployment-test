@@ -1,0 +1,8 @@
+# The log sources for this server are declared one file per source in
+# acquis.d/. This file is deliberately empty.
+#
+# It replaces the nginx, syslog and apache sources that the image ships with,
+# because none of those files exist on this server. Without this replacement
+# CrowdSec logs a "datasource unavailable" error for every one of them.
+#
+# An empty file is safe: CrowdSec skips empty acquisition documents.

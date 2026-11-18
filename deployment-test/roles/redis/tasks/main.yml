@@ -1,0 +1,23 @@
+---
+- name: Create redis directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/redis"
+    state: directory
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Template redis compose (canonical compose.yaml)
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ base_dir }}/redis/compose.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Start redis
+  community.docker.docker_compose_v2:
+    project_src: "{{ base_dir }}/redis"
+    state: present
+    pull: always
+  when: not ansible_check_mode

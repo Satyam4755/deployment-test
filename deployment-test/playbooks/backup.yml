@@ -1,0 +1,62 @@
+---
+# Offsite backups have their own lifecycle. This playbook is deliberately not
+# imported by site.yml or update.yml: a deployment must not fail because the
+# object-storage credentials are missing, and an image rollout must not rewrite
+# the backup script or trigger a backup run.
+#
+# Run this after site.yml, and before declaring the host production-ready. A
+# fresh host has no backup timer until this playbook succeeds.
+#
+#   ansible-playbook -i inventory/inventory.yml \
+#     --limit development -e target_env=development \
+#     --vault-id dev@/tmp/vault_pass \
+#     --become-password-file /tmp/become_pass \
+#     --private-key ~/.ssh/id_deploy playbooks/backup.yml
+#
+#   # Stop the timer without deleting the script or existing data:
+#   ansible-playbook ... -e backup_enabled=false playbooks/backup.yml
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Install and verify offsite backups
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Check that the application stack is deployed
+      # The backup reads the MariaDB container and the sites volume. Fail here
+      # with a clear message rather than deep inside the script or, worse, at
+      # 03:17 when someone needs a restore.
+      community.docker.docker_container_info:
+        name: mariadb-database
+      register: backup_mariadb_container
+      failed_when: false
+      when: backup_enabled | default(true) | bool
+
+    - name: Fail if the MariaDB container is missing
+      ansible.builtin.fail:
+        msg: >-
+          The mariadb-database container does not exist, so there is nothing to
+          back up. Run playbooks/site.yml first, then playbooks/backup.yml.
+      when:
+        - backup_enabled | default(true) | bool
+        - not (backup_mariadb_container.exists | default(false))
+
+    - name: Check that the sites volume exists
+      community.docker.docker_volume_info:
+        name: "{{ backup_sites_volume | default('erp_sites-vol') }}"
+      register: backup_sites_volume_info
+      failed_when: false
+      when: backup_enabled | default(true) | bool
+
+    - name: Fail if the sites volume is missing
+      ansible.builtin.fail:
+        msg: >-
+          The {{ backup_sites_volume | default('erp_sites-vol') }} volume does not exist. Run
+          playbooks/site.yml first, then playbooks/backup.yml.
+      when:
+        - backup_enabled | default(true) | bool
+        - not (backup_sites_volume_info.exists | default(false))
+
+  roles:
+    - role: backup

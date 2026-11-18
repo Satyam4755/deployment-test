@@ -1,0 +1,71 @@
+---
+# Mandatory first play of every playbook in this repo.
+#
+# A single inventory with both environments as groups means "which server am
+# I talking to?" is decided purely by --limit. This play turns a forgotten
+# --limit into a loud failure *before* any task mutates anything, instead of
+# silently applying production changes to the development host.
+#
+# It is imported, not run directly. Callers must pass -e target_env=<env>.
+#
+# NOTE: fail_msg strings below are deliberately literal. They must not
+# reference group_vars: if var loading itself is what failed (for example
+# because the wrong vault password was supplied and the *other* environment's
+# encrypted vault could not be decrypted), a templated fail_msg fails
+# finalization too and masks the true cause behind an "'x' is undefined"
+# error. A literal message always tells the operator what to fix.
+- name: Guard target environment
+  hosts: all
+  # No role gathers facts, so skip collection: the assertions below run
+  # without ever opening an SSH connection.
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Assert the runtime identity environment variables are set
+      # No IPs or usernames are committed to git, so these must be supplied
+      # per run. Locally: export them. In CI: GitHub Environment Variables.
+      ansible.builtin.assert:
+        that:
+          - target_env is defined
+          - target_env in ['development', 'production']
+          - lookup('env', 'TARGET_SERVER_HOST') | length > 0
+          - lookup('env', 'SSH_LOGIN_USER') | length > 0
+          - lookup('env', 'DEPLOY_OWNER_USER') | length > 0
+        fail_msg: >-
+          Run this playbook with an explicit environment:
+          --limit <development|production> and -e target_env=<environment>,
+          with TARGET_SERVER_HOST, SSH_LOGIN_USER and DEPLOY_OWNER_USER set.
+          In GitHub these come from Environment Variables; locally, export
+          them. Note: a vault decryption error here usually means you are
+          missing the --limit, which makes Ansible load the other
+          environment's vault too.
+        quiet: true
+
+    - name: Assert exactly one environment group is in scope
+      # This is the real safety property: it holds only when --limit narrowed
+      # the play to a single environment. Without --limit both environments
+      # are in the play, one host fails this assertion, and nothing later runs.
+      ansible.builtin.assert:
+        that:
+          - target_env in group_names
+          - (group_names | intersect(['development', 'production'])) | length == 1
+        fail_msg: >-
+          This host is in the wrong environment group for the requested
+          target_env. Always pass --limit <env> together with
+          -e target_env=<env> so exactly one environment is in scope.
+        quiet: true
+
+    - name: Fail if running any playbook in CI
+      # ADR-001: provisioning and configuration belong to an admin's control
+      # machine. CI deploys an application image by running the two root-owned
+      # host scripts (erp-deploy, erp-smoke); it never runs Ansible.
+      # Therefore every playbook that imports this guard must refuse to run
+      # while CI is set, with no exceptions.
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'CI') == ''
+        fail_msg: >-
+          This playbook cannot run in CI. Infrastructure changes require a
+          control machine with vault access. Use the deploy-app.yml workflow
+          for application deployments.
+        quiet: true

@@ -1,0 +1,167 @@
+---
+# Objective 4: roll out a newer image safely.
+#
+# The promotion flow is deliberately dev-first and explicit. This playbook
+# deploys ONE environment — whichever is selected by --limit — and the human
+# or the CI workflow decides when production runs it. There is no path here
+# that deploys both environments in a single run, because a failed image bump
+# should be caught in development while it is still cheap.
+#
+# The image identity is a sha256 digest, passed with
+# -e erp_image=sha256:<digest> (a full repo@sha256:<digest> is also
+# accepted). erp_image_version is only a human-readable label for records
+# and the asset marker; it is not the identity of the image (ADR-004).
+#
+#   # 1. development, dry run
+#   ansible-playbook -i inventory/inventory.yml --limit development \
+#     -e target_env=development -e erp_image=sha256:<digest> \
+#     --vault-id dev@/tmp/vault_pass playbooks/update.yml --check --diff
+#
+#   # 2. development, for real
+#   ansible-playbook -i inventory/inventory.yml --limit development \
+#     -e target_env=development -e erp_image=sha256:<digest> \
+#     --vault-id dev@/tmp/vault_pass playbooks/update.yml
+#
+#   # 3. smoke test (playbooks/smoke.yml runs automatically at the end)
+#
+#   # 4. production, only after 2 and 3 look right
+#   ansible-playbook -i inventory/inventory.yml --limit production \
+#     -e target_env=production -e erp_image=sha256:<digest> \
+#     --vault-id prod@/tmp/vault_pass playbooks/update.yml
+#
+# A production deploy passes the same digest with -e; no value in this
+# repository changes, so a one-off rollout never alters the committed default.
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Preflight the requested image digest
+  hosts: all
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Validate the requested image identity
+      # A tag is not a release identity: it can be repointed. Only a digest
+      # pins the exact bytes that ran in development.
+      ansible.builtin.assert:
+        that:
+          - erp_image is defined
+          - erp_image is match('^(sha256:[a-f0-9]{64}|.+@sha256:[a-f0-9]{64})$')
+        fail_msg: >-
+          erp_image must be a sha256 digest (sha256:<64 hex chars>) or a
+          repo@sha256:<digest> reference. Got
+          '{{ erp_image | default("<unset>") }}'.
+        quiet: true
+
+    - name: Extract the digest
+      ansible.builtin.set_fact:
+        requested_digest: "{{ erp_image | regex_search('sha256:[a-f0-9]{64}') }}"
+
+    - name: Pin the image and label the build
+      ansible.builtin.set_fact:
+        erp_image: "{{ erp_image_repository }}@{{ requested_digest }}"
+        erp_image_version: "{{ erp_build_label | default(requested_digest[7:19]) }}"
+
+    - name: Report what is currently running
+      community.docker.docker_container_info:
+        name: "{{ item }}"
+      loop:
+        - backend
+        - frappe-frontend
+      loop_control:
+        label: "{{ item }}"
+      register: smoke_preflight
+      failed_when: false
+
+    - name: Show the current image versus the requested one
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item }}: currently
+          {{ (item.containers | default([]) | first | default({})).Config.Image
+             | default('not running') }} -> requesting {{ erp_image }}. Full deployment runs from a
+          clean baseline, so a direct jump is expected rather than incremental.
+
+- name: Deploy the requested version
+  # The full stack, not just erp: a version bump can change the database
+  # schema or the compose wiring, and mariadb/redis/traefik may need to come
+  # up in a specific order for bench to boot.
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Ensure the stack base directory exists
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ deploy_owner_user }}"
+        group: "{{ deploy_owner_user }}"
+
+    - name: Ensure the network topology exists
+      community.docker.docker_network:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - traefik-public
+        - erp_default
+        - erp-db
+        - erp-cache
+      loop_control:
+        label: "network {{ item }}"
+
+    - name: Ensure docker-proxynet exists
+      community.docker.docker_network:
+        name: docker-proxynet
+        state: present
+        internal: true
+
+    - name: Ensure the shared volumes exist
+      community.docker.docker_volume:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - erp_sites-vol
+        - erp_assets-vol
+      loop_control:
+        label: "volume {{ item }}"
+
+  roles:
+    - role: traefik
+    - role: crowdsec
+    - role: mariadb
+    - role: redis
+    - role: erp
+    # Backups are not part of a rollout. They have an independent lifecycle in
+    # playbooks/backup.yml. See ADR-028.
+
+- name: Reclaim disk from the superseded image
+  # A version bump leaves the previous image behind, and the compose files pull
+  # on every run. Without this the root filesystem fills over a handful of
+  # releases and takes MariaDB down with it. The retention window in
+  # roles/docker keeps a rollback target available.
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Prune images unused for longer than the retention window
+      ansible.builtin.command:
+        cmd: >-
+          docker image prune --all --force
+          --filter "until={{ docker_prune_images_after | default('168h') }}"
+      register: update_prune
+      changed_when: >-
+        'Total reclaimed space: 0B' not in (update_prune.stdout | default(''))
+
+    - name: Report reclaimed space
+      ansible.builtin.debug:
+        msg: "{{ update_prune.stdout_lines | default([]) | last | default('nothing to prune') }}"
+
+- name: Verify the rollout
+  # Imported rather than duplicated, so this playbook and playbooks/smoke.yml
+  # can never check different things. A successful run of this file therefore
+  # means a working site, not merely a successful Ansible execution.
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the post-deployment checks
+      ansible.builtin.import_tasks: tasks/smoke.yml

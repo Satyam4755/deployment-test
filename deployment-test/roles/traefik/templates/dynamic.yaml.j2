@@ -1,0 +1,105 @@
+http: # http dynamic config root; routers/middlewares applied per-router, never on entrypoint
+  middlewares: # router-level middleware catalog
+{% if traefik_crowdsec_enabled | default(false) %}
+    crowdsec-bouncer: # CrowdSec IPS verdict enforcement; attach first in chain (enabled via traefik_crowdsec_enabled)
+      plugin: # plugin stanza
+        crowdsec-bouncer-traefik-plugin: # must match experimental.plugins name in static
+          enabled: true # master switch for bouncer
+          crowdsecMode: {{ traefik_bouncer_mode | default('stream') }} # stream=cached bans, ~0ms, LAPI-tolerant; live=per-request query (higher latency)
+          crowdsecLapiScheme: http # the LAPI speaks plain HTTP inside the docker network
+          crowdsecLapiHost: crowdsec:8080 # LAPI host:port; requires crowdsec on the crowdsec-net network
+          crowdsecLapiKeyFile: /run/secrets/crowdsec_lapi_key # LAPI bouncer key from Compose secret
+          crowdsecAppsecEnabled: {{ traefik_bouncer_appsec_enabled | default(true) | bool | ternary('true', 'false') }} # enable AppSec WAF
+          crowdsecAppsecHost: "{{ traefik_bouncer_appsec_host | default('crowdsec:7422') }}" # AppSec listener on crowdsec-net
+          crowdsecAppsecFailureBlock: {{ traefik_bouncer_appsec_failure_block | default(true) | bool | ternary('true', 'false') }} # block when AppSec returns an error
+          crowdsecAppsecUnreachableBlock: {{ traefik_bouncer_appsec_unreachable_block | default(true) | bool | ternary('true', 'false') }} # block when AppSec is unreachable
+          crowdsecAppsecBodyLimit: {{ traefik_bouncer_appsec_body_limit | default(10485760) | int }} # max request body forwarded to AppSec (10 MB)
+          crowdsecAppsecUnreadableBodyBlock: {{ traefik_bouncer_appsec_unreadable_body_block | default(true) | bool | ternary('true', 'false') }} # block a body AppSec cannot read
+          # Fail-closed: wait for initial decision stream before serving
+          streamStartupBlock: {{ traefik_bouncer_stream_startup_block | default(true) | bool | ternary('true', 'false') }}
+          # Fail-closed: a failed stream refresh is a failure
+          updateMaxFailure: {{ traefik_bouncer_update_max_failure | default(0) | int }}
+          # Stream refresh interval (seconds)
+          updateIntervalSeconds: {{ traefik_bouncer_update_interval | default(10) | int }}
+          # Trust X-Forwarded-For from traefik_trusted_ips (mode-dependent)
+          forwardedHeadersTrustedIPs:
+{% for ip in traefik_trusted_ips | default([]) %}
+            - "{{ ip }}"
+{% endfor %}
+{% endif %}
+    # Private dashboard allowlist - accepts localhost and private networks only
+    dashboard-allow:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+    cloudflare-allow: # router-level IP allowlist; only on public app router in Cloudflare proxy mode
+      ipAllowList:
+        sourceRange:
+{% for ip in traefik_allowlist_ips | default([]) %}
+          - "{{ ip }}"
+{% endfor %}
+    rate-limit-default: # general/dashboard limiter
+      rateLimit:
+        average: {{ traefik_rate_average | default(20) }}
+        burst: {{ traefik_rate_burst | default(40) }}
+        period: 1m
+        sourceCriterion:
+          ipStrategy:
+            depth: 1
+    rate-limit-frappe: # frappe ERP limiter; higher headroom for desk + api
+      rateLimit:
+        average: {{ frappe_rate_average | default(50) }}
+        burst: {{ frappe_rate_burst | default(100) }}
+        period: 1m
+        sourceCriterion:
+          ipStrategy:
+            depth: 1
+    security-headers: # base headers for dashboard; deny framing
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow"
+    security-headers-frappe: # frappe variant; SAMEORIGIN framing for desk components
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: false
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow"
+    frappe-csp: # frappe CSP; unsafe-inline/eval required by frappe UI build
+      headers:
+        contentSecurityPolicy: "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:"
+tls: # TLS hardening block
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+        - TLS_AES_256_GCM_SHA384
+        - TLS_AES_128_GCM_SHA256
+        - TLS_CHACHA20_POLY1305_SHA256
+      curvePreferences:
+        - CurveP521
+        - CurveP384
+      sniStrict: true

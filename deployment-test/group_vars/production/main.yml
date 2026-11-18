@@ -1,0 +1,30 @@
+---
+# Production values. Secrets in vault.yml (vault-id: prod).
+env_name: "production"
+base_dir: "{{ deploy_owner_home }}/app_server"
+
+# Edge mode: Cloudflare proxy (orange cloud, DNS-01).
+# Create the proxied DNS record before applying this configuration; otherwise
+# the origin allowlist rejects requests that do not arrive through Cloudflare.
+traefik_cert_resolver: "cloudflare"
+traefik_trusted_ips: "{{ cloudflare_ips + ['127.0.0.1/32'] }}"
+traefik_origin_cloudflare_only: true
+
+# Traefik
+cloudflare_acme_server: "{{ acme_prod_url }}"
+traefik_log_level: "INFO"
+traefik_cpus_limit: "1.00"
+traefik_memory_limit: "512M"
+traefik_rate_average: 60
+traefik_rate_burst: 120
+frappe_rate_average: 300
+frappe_rate_burst: 600
+# Bootstrap value, not the target state. Production starts with the Traefik
+# bouncer off because it is fail-closed: an AppSec error, a rejected key or a
+# stale decision stream blocks every request. The target state is `true`.
+# Keep this false until the same checks that pass in development also pass
+# here: run playbooks/crowdsec.yml, then playbooks/smoke.yml, and confirm
+# that "bouncer `traefik` registered with the vault key: yes" and that a
+# test decision is served from the LAPI to the Traefik container. Then set it
+# to true and run playbooks/site.yml. See ADR-025 and RUNBOOK.md section 15.3.
+traefik_crowdsec_enabled: false

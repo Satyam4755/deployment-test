@@ -1,0 +1,29 @@
+---
+- name: Validate the daemon configuration
+  # A malformed daemon.json stops Docker from starting at all, which on a
+  # Docker host means every container stays down. Validate before restarting.
+  ansible.builtin.command:
+    cmd: dockerd --validate --config-file /etc/docker/daemon.json
+  register: docker_daemon_validate
+  changed_when: false
+  failed_when: docker_daemon_validate.rc != 0
+  listen: Restart docker
+
+- name: Restart docker
+  # live-restore keeps running containers alive across this restart, so the
+  # Frappe stack is not taken down when the daemon config changes.
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+  listen: Restart docker
+
+- name: Re-apply the DOCKER-USER chain after the restart
+  # Docker rebuilds its chains on start, discarding the firewall rules
+  # installed by roles/base. Re-apply them or the host is unprotected until
+  # the next reboot.
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/apply-docker-user-rules
+  register: docker_user_reapply
+  changed_when: true
+  failed_when: false
+  listen: Restart docker

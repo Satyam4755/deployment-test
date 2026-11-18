@@ -1,0 +1,36 @@
+# CrowdSec firewall bouncer configuration (nftables).
+# Managed by Ansible - do not edit manually.
+#
+# Schema follows cs-firewall-bouncer: `mode` and `update_frequency` are
+# top-level, and the nftables tables/chains live under nftables.ipv4/ipv6.
+# Unknown keys are ignored by the bouncer, so an invented schema fails silently.
+mode: nftables
+api_url: "http://127.0.0.1:8080/"
+api_key: "{{ crowdsec_firewall_key }}"
+
+# New decisions are pulled every 10 seconds.
+update_frequency: 10s
+
+# Drop silently; do not send a reset back to a banned source.
+deny_action: DROP
+deny_log: false
+
+# Filter both address families.
+disable_ipv4: false
+disable_ipv6: false
+
+log_mode: stdout
+log_level: info
+
+# Managed mode: the bouncer creates these tables, chains and per-origin sets.
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+  ipv6:
+    enabled: true
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain

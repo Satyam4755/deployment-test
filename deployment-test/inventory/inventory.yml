@@ -1,0 +1,39 @@
+---
+# Single inventory for BOTH environments. Do not split this back into
+# per-environment files: the whole point is that the access model is defined
+# exactly once (in group_vars/all) and the only per-environment difference is
+# group membership, which selects the matching group_vars/<env>/ directory.
+#
+# Usage — always scope to one environment:
+#   ansible-playbook -i inventory/inventory.yml --limit development \
+#     -e target_env=development playbooks/site.yml
+#   ansible-playbook -i inventory/inventory.yml --limit production \
+#     -e target_env=production playbooks/site.yml
+#
+# Every playbook in playbooks/ starts with a guard play that asserts
+# `target_env` is set and that exactly one environment group is in scope.
+# Running without --limit therefore fails loudly instead of silently applying
+# production changes to the development host.
+#
+# No IPs, ports, or usernames are committed. They resolve at runtime from
+# environment variables supplied by GitHub Environment Variables in CI, or
+# exported locally:
+#   TARGET_SERVER_HOST  server IP
+#   SSH_LOGIN_USER      your own named admin account (key-only)
+#   DEPLOY_OWNER_USER   service identity reached via `sudo -u` for stack work
+#   SSH_PORT            optional, defaults to vault_ssh_port
+#
+# Access model: SSH as a named admin, then `sudo` with that admin's own
+# password. Ansible escalates to root; stack work can `sudo -u deployowner`.
+# Never SSH directly as the owner or root.
+#
+# Server-side bootstrap, once per server as root — substitute your own values.
+# roles/base and roles/docker automate this; see playbooks/server.yml.
+all:
+  children:
+    development:
+      hosts:
+        dev_server: {}
+    production:
+      hosts:
+        prod_server: {}

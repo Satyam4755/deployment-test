@@ -1,0 +1,29 @@
+# CODEOWNERS for the deployment repository.
+#
+# The owner handle is deliberately a neutral placeholder. Set the real team in
+# the GitHub repository settings (or in a private fork) instead of committing
+# an organisation or personal handle here: CODEOWNERS is a public file and
+# would otherwise reveal who maintains the stack. See ADR-026.
+#
+# Branch protection should require review from the team that owns these paths.
+
+# GitHub Actions workflows - infrastructure changes require maintainer review
+.github/workflows/    @example-org/maintainers
+
+# Ansible playbooks - infrastructure as code
+playbooks/            @example-org/maintainers
+
+# Role definitions - changes affect server configuration
+roles/                @example-org/maintainers
+
+# Group variables - configuration for all environments
+group_vars/           @example-org/maintainers
+
+# Inventory - host definitions
+inventory/            @example-org/maintainers
+
+# Ansible configuration
+ansible.cfg           @example-org/maintainers
+
+# Documentation - architecture and operational procedures
+docs/                 @example-org/maintainers

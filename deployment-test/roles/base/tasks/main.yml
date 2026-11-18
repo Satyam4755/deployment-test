@@ -1,0 +1,43 @@
+---
+# Host hardening. Applied identically to every environment — see
+# playbooks/server.yml.
+#
+# Task order is load-bearing:
+#   system.yml      packages and kernel settings, no access changes
+#   users.yml       creates admin accounts, deployowner, base_operators group, sudo rule
+#   ci_deploy.yml   creates ci-deploy account and restricted sudo rule (when key exists)
+#   ssh.yml         locks down sshd, only once usable keys are in place
+#   firewall.yml    denies inbound, SSH rule installed before UFW is enabled
+- name: Apply system hardening
+  ansible.builtin.import_tasks:
+    file: system.yml
+  tags: [base, system]
+
+- name: Establish the two-layer access model
+  ansible.builtin.import_tasks:
+    file: users.yml
+  tags: [base, users]
+
+- name: Create ci-deploy pipeline identity
+  # Registered only once a real key is supplied. users.yml derives AllowUsers
+  # from the same flag, so the account and its sshd entry appear together.
+  ansible.builtin.include_tasks:
+    file: ci_deploy.yml
+  when: ci_deploy_registered | bool
+  tags: [base, ci_deploy]
+
+- name: Harden the SSH daemon
+  ansible.builtin.import_tasks:
+    file: ssh.yml
+  tags: [base, ssh]
+
+- name: Configure the host firewall
+  ansible.builtin.import_tasks:
+    file: firewall.yml
+  tags: [base, firewall]
+
+# Flush before the role ends so the sshd reload and UFW reload happen as part
+# of this role, rather than being deferred to the end of a long site.yml run
+# where a later failure would silently leave them unapplied.
+- name: Apply pending hardening handlers
+  ansible.builtin.meta: flush_handlers

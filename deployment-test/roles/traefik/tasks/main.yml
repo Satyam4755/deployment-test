@@ -1,0 +1,128 @@
+---
+- name: Fail if placeholder secrets are used
+  # `default('CHANGE_ME', true)` means a *missing* vault key is treated as a
+  # placeholder, so we fail with a clear message instead of an undefined error.
+  # The ACME contact is mode-neutral; the Cloudflare token is only needed when
+  # the selected resolver is DNS-01.
+  ansible.builtin.fail:
+    msg: >-
+      Deployment aborted: set real vault values for {{ env_name | default('this env') }}
+      (vault_crowdsec_key, vault_traefik_dashboard_users, vault_cloudflare_email).
+  when:
+    - crowdsec_traefik_key | default('', true) is match('^CHANGE_ME') or
+      crowdsec_traefik_key | default('', true) | length == 0 or
+      traefik_dashboard_users | default('', true) is match('^CHANGE_ME') or
+      traefik_dashboard_users | default('', true) | length == 0 or
+      cloudflare_email | default('', true) is match('^CHANGE_ME') or
+      cloudflare_email | default('', true) | length == 0 or
+      (traefik_cert_resolver | default('http') == 'cloudflare' and
+       (cf_token | default('', true) | length == 0 or
+        cf_token | default('', true) is match('^CHANGE_ME')))
+  no_log: true
+
+- name: Ensure traefik-public edge network exists
+  community.docker.docker_network:
+    name: traefik-public
+    state: present
+
+- name: Ensure docker-proxynet internal backchannel exists
+  community.docker.docker_network:
+    name: docker-proxynet
+    state: present
+    internal: true
+
+- name: Ensure the crowdsec private network exists
+  # Only Traefik and CrowdSec join this one. The app containers cannot reach
+  # the CrowdSec API, so a compromised app cannot query or change decisions.
+  community.docker.docker_network:
+    name: "{{ traefik_crowdsec_network | default('crowdsec-net') }}"
+    state: present
+
+- name: Create traefik directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/traefik"
+    state: directory
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create traefik configs directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/traefik/configs"
+    state: directory
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create traefik secrets directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/traefik/secrets"
+    state: directory
+    mode: '0710'
+    owner: "{{ deploy_owner_user }}"
+    group: "65532"
+
+- name: Write CrowdSec LAPI key secret
+  # The bouncer key is mounted as a Compose secret, never written to config or env.
+  ansible.builtin.copy:
+    dest: "{{ base_dir }}/traefik/secrets/crowdsec-lapi-key"
+    content: "{{ crowdsec_traefik_key }}"
+    mode: '0440'
+    owner: "{{ deploy_owner_user }}"
+    group: "65532"
+  no_log: true
+  notify: Restart traefik
+
+- name: Write dashboard users secret
+  # One `user:hash` line per admin. Rendered from vault_traefik_dashboard_users map.
+  ansible.builtin.copy:
+    dest: "{{ base_dir }}/traefik/secrets/dashboard-users"
+    content: "{{ traefik_dashboard_users }}"
+    mode: '0440'
+    owner: "{{ deploy_owner_user }}"
+    group: "65532"
+  no_log: true
+  notify: Restart traefik
+
+- name: Template traefik static config
+  ansible.builtin.template:
+    src: static.yaml.j2
+    dest: "{{ base_dir }}/traefik/configs/traefik.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  notify: Restart traefik
+
+- name: Template traefik dynamic config
+  ansible.builtin.template:
+    src: dynamic.yaml.j2
+    dest: "{{ base_dir }}/traefik/configs/config.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  notify: Restart traefik
+
+- name: Template traefik env file
+  ansible.builtin.template:
+    src: traefik.env.j2
+    dest: "{{ base_dir }}/traefik/.env"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+  notify: Restart traefik
+
+- name: Template traefik compose (canonical compose.yaml)
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ base_dir }}/traefik/compose.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  notify: Restart traefik
+
+- name: Start traefik
+  community.docker.docker_compose_v2:
+    project_src: "{{ base_dir }}/traefik"
+    state: present
+    pull: always

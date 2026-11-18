@@ -1,0 +1,66 @@
+---
+# Standalone CrowdSec deployment — Phase 2b of the edge stack.
+#
+# Run AFTER playbooks/traefik.yml. CrowdSec reads Traefik's access log from
+# the shared traefik-logs volume and serves decisions over the LAPI on the
+# traefik-public network; neither exists until Traefik has run at least once.
+#
+# Local usage (no stored credentials — passwords are typed per run):
+#   printf 'vault-pass' > /tmp/vault_pass && chmod 600 /tmp/vault_pass
+#   printf 'sudo-pass'  > /tmp/become_pass && chmod 600 /tmp/become_pass
+#   ansible-playbook -i inventory/inventory.yml \
+#     --limit development -e target_env=development \
+#     --vault-id dev@/tmp/vault_pass \
+#     --become-password-file /tmp/become_pass \
+#     --private-key ~/.ssh/id_deploy playbooks/crowdsec.yml
+#   shred -u /tmp/vault_pass /tmp/become_pass
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Deploy CrowdSec
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Ensure the stack base directory exists
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ deploy_owner_user }}"
+        group: "{{ deploy_owner_user }}"
+
+    # The Traefik edge networks must exist before a compose file that declares
+    # them `external: true` can start. Idempotent, so re-running after
+    # playbooks/traefik.yml changes nothing.
+    - name: Ensure traefik-public edge network exists
+      community.docker.docker_network:
+        name: traefik-public
+        state: present
+
+    # The private network that Traefik and CrowdSec share. The compose file
+    # declares it `external: true`, so it has to exist first.
+    - name: Ensure crowdsec-net exists
+      community.docker.docker_network:
+        name: "{{ traefik_crowdsec_network | default('crowdsec-net') }}"
+        state: present
+
+    # CrowdSec reads Traefik's access log, and that log lives in a volume
+    # only the Traefik compose project creates. Check explicitly so running
+    # this playbook in the wrong order reports that, rather than surfacing
+    # later as a confusing container-start failure.
+    - name: Check whether Traefik has been deployed
+      community.docker.docker_container_info:
+        name: traefik
+      register: crowdsec_traefik_container
+      failed_when: false
+
+    - name: Fail if Traefik has not been deployed yet
+      ansible.builtin.fail:
+        msg: >-
+          The Traefik container does not exist, so CrowdSec has no access log
+          to parse. Run playbooks/traefik.yml first.
+      when: not crowdsec_traefik_container.exists | default(false)
+
+  roles:
+    - role: crowdsec

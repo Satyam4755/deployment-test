@@ -1,0 +1,30 @@
+.DS_Store
+
+# Ansible Vault password files — never commit these.
+.vault_pass*
+.vault_pass_dev
+.vault_pass_prod
+.vault_pass.txt
+
+# Per-environment vault files hold real identifiers and secrets. The encrypted
+# production vault is tracked deliberately; the development vault is created
+# locally from examples/vault.development.yml and never committed in plaintext.
+group_vars/development/vault.yml
+
+# Runtime env files. Generated on the target host by Ansible (mode 0600);
+# a local copy must never be committed.
+.env
+*.env
+!.env.example
+
+# Optional local denylist for scripts/check-sensitive.sh. Never commit it:
+# it contains the real identifiers the check is meant to protect.
+.sensitive-patterns
+
+# Leaked-secret detection scratch files
+*.pem
+*.key
+!roles/*/templates/*.j2
+
+# Ansible retry files
+*.retry

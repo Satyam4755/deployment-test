@@ -1,0 +1,46 @@
+# CrowdSec profile order is significant: SSH gets its dedicated duration,
+# non-remediation alerts are notification-only, and remaining remediation
+# alerts retain the general policy.
+---
+name: ssh_bruteforce
+filters:
+  - >-
+    Alert.Remediation == true && Alert.GetScope() == "Ip" &&
+    Alert.GetScenario() in ["crowdsecurity/ssh-bf",
+    "crowdsecurity/ssh-slow-bf", "crowdsecurity/ssh-bf_user-enum",
+    "crowdsecurity/ssh-slow-bf_user-enum"]
+decisions:
+  - type: ban
+    duration: 24h
+{% if crowdsec_telegram_enabled | default(true) %}
+notifications:
+  - telegram
+{% endif %}
+on_success: break
+---
+name: non_remediation_alerts
+filters:
+  - Alert.Remediation == false
+{% if crowdsec_telegram_enabled | default(true) %}
+notifications:
+  - telegram
+{% endif %}
+on_success: break
+---
+name: default_remediation
+filters:
+  - Alert.Remediation == true && Alert.GetScope() == "Ip"
+  - Alert.Remediation == true && Alert.GetScope() == "Range"
+  - Alert.Remediation == true && Alert.GetScope() == "User"
+  - Alert.Remediation == true && Alert.GetScope() == "Ip|Range"
+  - Alert.Remediation == true && Alert.GetScope() == "Ip|User"
+  - Alert.Remediation == true && Alert.GetScope() == "Range|User"
+  - Alert.Remediation == true && Alert.GetScope() == "Ip|Range|User"
+decisions:
+  - type: ban
+    duration: 4h
+{% if crowdsec_telegram_enabled | default(true) %}
+notifications:
+  - telegram
+{% endif %}
+on_success: break

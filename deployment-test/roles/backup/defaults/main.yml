@@ -1,0 +1,77 @@
+---
+# Offsite backup for the Frappe stack.
+#
+# Two artefacts, because either alone is a partial backup:
+#   1. a MariaDB logical dump  - the data
+#   2. a tar of the sites volume - uploaded files, site config, installed apps
+#
+# A dump without the sites volume loses every attachment. A sites tar without
+# a dump restores a site with an empty database. Restoring needs both, and they
+# must be from the same run, which is why they share one timestamped
+# directory.
+#
+# Storage is an S3-compatible bucket (AWS S3, Backblaze B2, MinIO, Wasabi)
+# reached through rclone. rclone is used rather than the AWS SDK modules
+# because it needs no Python boto stack on the host and speaks every
+# S3-compatible provider with one binary.
+
+# Set false to remove the timers without deleting the script.
+backup_enabled: true
+
+# systemd OnCalendar. A full date specification is required: a bare "03:17"
+# is rejected as an invalid calendar event. 03:17 rather than 03:00 so this
+# does not collide with every other scheduled job on the planet. Override in
+# group_vars/<env>/main.yml, e.g. "Sun *-*-* 02:00:00" for weekly.
+backup_calendar: "*-*-* 03:17:00"
+# Catch up after the host was off at the scheduled time, so a reboot or an
+# outage does not silently skip a day's backup.
+backup_persistent: true
+
+# Local staging before upload. A failed upload should not lose the dump, and
+# a recent backup should survive an object-storage outage.
+backup_local_dir: /var/backups/erp
+backup_local_keep_days: 2
+
+# Remote retention. Applied by the script with `rclone delete --min-age`, so
+# it works on any S3-compatible provider; a bucket lifecycle rule is still
+# worth configuring as a second line of defence.
+backup_retention_days: 30
+
+# rclone remote name (the `[name]` in rclone.conf) and the destination prefix.
+# The full path is <remote>:<bucket>/<env>/<timestamp>/.
+#
+# The remote, bucket and endpoint name the provider account the business owns,
+# so they are confidential identifiers and live in the vault. See ADR-026.
+# `mandatory` makes a missing key fail loudly instead of uploading backups to
+# a placeholder destination.
+backup_remote_name: "{{ vault_backup_remote_name | mandatory }}"
+backup_bucket: "{{ vault_backup_bucket | mandatory }}"
+backup_storage_class: STANDARD
+
+# S3-compatible endpoint. Leave empty in the vault for real AWS S3, which
+# resolves its own endpoints; set it for B2/MinIO/Wasabi.
+backup_endpoint: "{{ vault_backup_endpoint | mandatory }}"
+backup_region: "auto"
+
+# Object storage credentials. From the vault; never committed in plaintext.
+backup_access_key_id: "{{ vault_backup_access_key_id | default('') }}"
+backup_secret_access_key: "{{ vault_backup_secret_access_key | default('') }}"
+
+# --- mariadb dump ---
+# --single-transaction gives a consistent InnoDB snapshot without locking
+# tables, so the dump does not stall the ERP.
+backup_mysqldump_extra_args: >-
+  --single-transaction
+  --quick
+  --routines
+  --triggers
+  --events
+  --hex-blob
+  --default-character-set=utf8mb4
+
+# --- explicit backup inputs ---
+# Database name is read from site_config.json at runtime (no hardcoded fallback).
+# The sites volume path is derived from the Compose volume name.
+# These are documented here for clarity but computed at runtime in backup.sh.j2.
+backup_db_name: ""  # Computed from site_config.json
+backup_sites_volume: "erp_sites-vol"

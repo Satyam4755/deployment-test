@@ -1,0 +1,36 @@
+---
+# Development values. Secrets in vault.yml (vault-id: dev).
+env_name: "development"
+base_dir: "{{ deploy_owner_home }}/app_server_dev"
+
+# Edge mode: Cloudflare DNS-01 validation
+traefik_cert_resolver: "cloudflare"
+traefik_trusted_ips:
+  - "127.0.0.1/32"
+
+# Traefik — production ACME endpoint
+cloudflare_acme_server: "{{ acme_prod_url }}"
+traefik_log_level: "DEBUG"
+traefik_cpus_limit: "0.50"
+traefik_memory_limit: "256M"
+traefik_rate_average: 100
+traefik_rate_burst: 200
+frappe_rate_average: 200
+frappe_rate_burst: 400
+# The CrowdSec bouncer is on in development so the whole chain is exercised:
+# access log -> acquisition -> parser -> scenario -> decision -> bouncer.
+# The bouncer is fail-closed, so a CrowdSec/AppSec outage is an HTTP outage by
+# design. That is why the Traefik bouncer is proven here before production.
+traefik_crowdsec_enabled: true
+
+crowdsec_telegram_enabled: false
+
+# Host firewall bouncer disabled in development; Traefik bouncer handles HTTP protection
+crowdsec_firewall_bouncer_enabled: false
+
+# CrowdSec container DNS configuration (bypasses systemd-resolved stub 127.0.0.53)
+crowdsec_dns_servers:
+  - "192.168.0.1"
+
+# CrowdSec Local API client destination URL
+crowdsec_lapi_url: "http://127.0.0.1:8080"

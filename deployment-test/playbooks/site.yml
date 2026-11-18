@@ -1,0 +1,184 @@
+---
+# Full stack in dependency order: traefik -> crowdsec -> mariadb -> redis -> erp.
+#
+# Local usage (no stored credentials — passwords are typed per run):
+#   printf 'vault-pass' > /tmp/vault_pass && chmod 600 /tmp/vault_pass
+#   printf 'sudo-pass'  > /tmp/become_pass && chmod 600 /tmp/become_pass
+#
+#   dev:  ansible-playbook -i inventory/inventory.yml \
+#           --limit development -e target_env=development \
+#           --vault-id dev@/tmp/vault_pass \
+#           --become-password-file /tmp/become_pass \
+#           --private-key ~/.ssh/id_deploy playbooks/site.yml
+#
+#   prod: ansible-playbook -i inventory/inventory.yml \
+#           --limit production -e target_env=production \
+#           --vault-id prod@/tmp/vault_pass \
+#           --become-password-file /tmp/become_pass \
+#           --private-key ~/.ssh/id_deploy playbooks/site.yml
+#
+#   shred -u /tmp/vault_pass /tmp/become_pass
+#
+# Note: only the vault-id for the *selected* environment is passed. Without
+# --limit, Ansible loads the other environment's vault too and fails to
+# decrypt it — which is why the guard play below insists on --limit.
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Prepare networks and shared volumes
+  hosts: all
+  become: true
+  # No role uses gathered facts; skipping collection keeps the guard's
+  # assertions ahead of any SSH connection.
+  gather_facts: false
+  tasks:
+    - name: Ensure the stack base directory exists
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ deploy_owner_user }}"
+        group: "{{ deploy_owner_user }}"
+
+    # Network topology, created here so no role has to assume an ordering
+    # between itself and another role, and so a compose file that declares
+    # `external: true` can never fail with "network not found":
+    #   traefik-public   internet -> traefik -> frappe-frontend
+    #   docker-proxynet  traefik <-> socket-proxy (internal, no gateway)
+    #   crowdsec-net     traefik <-> crowdsec (the app containers stay out)
+    #   erp_default  frappe service-to-service
+    #   erp-db       MariaDB + configurator + backend + workers + scheduler
+    #   erp-cache    Redis (cache + queue) + configurator + backend + websocket + workers + scheduler
+    #
+    # The traefik role also declares these with `state: present`, which is
+    # idempotent — so playbooks/traefik.yml still works standalone while
+    # site.yml remains the single owner of the shared topology.
+    - name: Ensure traefik-public edge network exists
+      community.docker.docker_network:
+        name: traefik-public
+        state: present
+
+    - name: Ensure docker-proxynet backchannel network exists
+      community.docker.docker_network:
+        name: docker-proxynet
+        state: present
+        internal: true
+
+    # Private link between Traefik and CrowdSec. Only those two join it, so
+    # the app containers cannot reach the CrowdSec API.
+    - name: Ensure crowdsec-net exists
+      community.docker.docker_network:
+        name: "{{ traefik_crowdsec_network | default('crowdsec-net') }}"
+        state: present
+
+    - name: Ensure erp_default network exists
+      community.docker.docker_network:
+        name: erp_default
+        state: present
+
+    - name: Ensure erp-db network exists
+      community.docker.docker_network:
+        name: erp-db
+        state: present
+        internal: true
+
+    - name: Ensure erp-cache network exists
+      community.docker.docker_network:
+        name: erp-cache
+        state: present
+        internal: true
+
+    # The erp compose file declares both of these as `external: true`, so
+    # Compose will not create them. Without these two tasks the stack fails
+    # to start with "network/volume not found" before a single container runs.
+    - name: Ensure the shared sites volume exists
+      community.docker.docker_volume:
+        name: erp_sites-vol
+        state: present
+
+    - name: Ensure the shared assets volume exists
+      community.docker.docker_volume:
+        name: erp_assets-vol
+        state: present
+
+- name: Deploy Traefik
+  hosts: all
+  become: true
+  tags: [traefik]
+  roles:
+    - role: traefik
+
+- name: Deploy CrowdSec
+  hosts: all
+  become: true
+  tags: [crowdsec]
+  roles:
+    - role: crowdsec
+
+- name: Deploy MariaDB
+  hosts: all
+  become: true
+  tags: [mariadb]
+  roles:
+    - role: mariadb
+
+- name: Deploy Redis
+  hosts: all
+  become: true
+  tags: [redis]
+  roles:
+    - role: redis
+
+- name: Wait for the datastore to accept connections
+  # mariadb and redis run as separate compose projects, so compose's own
+  # `depends_on: service_healthy` cannot span them. Gate on real readiness
+  # instead, otherwise bench starts before the database is accepting
+  # connections and dies in a crash loop.
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for MariaDB to report healthy
+      community.docker.docker_container_exec:
+        container: mariadb-database
+        command: healthcheck.sh --connect --innodb_initialized
+      register: mariadb_health
+      until: mariadb_health.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait for Redis cache to accept PING
+      community.docker.docker_container_exec:
+        container: redis-cache
+        command: redis-cli ping
+      register: redis_cache_health
+      until: redis_cache_health.rc == 0
+      retries: 15
+      delay: 3
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait for Redis queue to accept PING
+      community.docker.docker_container_exec:
+        container: redis-queue
+        command: redis-cli ping
+      register: redis_queue_health
+      until: redis_queue_health.rc == 0
+      retries: 15
+      delay: 3
+      changed_when: false
+      when: not ansible_check_mode
+
+- name: Deploy ERP App
+  hosts: all
+  become: true
+  tags: [erp]
+  roles:
+    - role: erp
+
+# Backups are deliberately not installed here. They have an independent
+# lifecycle in playbooks/backup.yml: a deployment must not fail because the
+# object-storage credentials are missing, and an image rollout must not rewrite
+# the backup script. Run playbooks/backup.yml after this playbook. See ADR-028.

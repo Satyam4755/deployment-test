@@ -1,0 +1,33 @@
+---
+crowdsec_image: "crowdsecurity/crowdsec:v1.8.2"
+# Network shared with Traefik only. Must match the traefik role.
+crowdsec_network: "crowdsec-net"
+
+# DNS servers for the CrowdSec container to avoid inheriting systemd-resolved stub (127.0.0.53).
+crowdsec_dns_servers:
+  - "192.168.0.1"
+
+# Local API client destination URL for internal cscli and agent communication.
+# LAPI listening address remains 0.0.0.0:8080; client queries loopback inside the container.
+crowdsec_lapi_url: "http://127.0.0.1:8080"
+
+# Host firewall bouncer (nftables package on host)
+crowdsec_firewall_bouncer_enabled: true
+
+# Collections to install. The target set is deliberately small and non-overlapping.
+# crowdsecurity/traefik - parses Traefik access log
+# crowdsecurity/linux - SSH brute force detection
+# crowdsecurity/appsec-virtual-patching - AppSec WAF
+crowdsec_collections:
+  - crowdsecurity/traefik
+  - crowdsecurity/linux
+  - crowdsecurity/appsec-virtual-patching
+  - crowdsecurity/appsec-generic-rules
+
+# AppSec settings
+crowdsec_appsec_enabled: true
+crowdsec_appsec_listen: "0.0.0.0:7422"
+crowdsec_appsec_config: "crowdsecurity/appsec-default"
+
+# Telegram notifications
+crowdsec_telegram_enabled: true

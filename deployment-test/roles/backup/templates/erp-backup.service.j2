@@ -1,0 +1,30 @@
+[Unit]
+# Managed by Ansible (roles/backup).
+Description=Back up the Frappe stack to object storage
+Documentation=https://github.com/example-org/deployment
+# The dump reads the MariaDB container and the sites volume, so both the
+# compose projects and Docker must already be up.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/erp-backup
+# A hung mysqldump must not hold the timer slot forever. rclone transfers
+# are the slow part, so the timeout is generous.
+TimeoutStartSec=3600
+# The script needs the root password from the MariaDB secret and reads the
+# volume data directly. rclone's config lives in /root/.config/rclone, so
+# /root must stay readable; ProtectSystem still keeps the rest of the host
+# read-only apart from the backup staging directory.
+User=root
+Group=root
+# A backup job is a bulk read and write; it needs very little else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths={{ backup_local_dir }}
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2 @@
+---
+mariadb_image: "mariadb:11.8"

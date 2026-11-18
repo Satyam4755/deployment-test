@@ -1,0 +1,8 @@
+---
+- name: Reload systemd
+  # The service and timer units are rewritten by the role. A reload must happen
+  # before the verification run starts the service, so the handler is flushed
+  # explicitly in tasks/main.yml rather than at the end of the play.
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: Reload systemd

@@ -1,0 +1,70 @@
+---
+# Docker Engine installation and daemon hardening.
+#
+# Scope is deliberately limited to hardening that does not change how the
+# stack's compose files behave: log rotation, live-restore and
+# no-new-privileges. `icc: false`, `userland-proxy: false` and
+# `userns-remap` are NOT set — see the note in tasks/main.yml.
+
+# Keyrings, not apt-key. The old `apt-key` path is deprecated and leaks
+# keyring warnings on every apt run.
+docker_apt_keyring: /etc/apt/keyrings/docker.asc
+docker_apt_repository: /etc/apt/sources.list.d/docker.list
+docker_apt_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_apt_dependencies:
+  - ca-certificates
+  - curl
+  - gnupg
+
+# Groups whose members may talk to the Docker socket.
+#
+# MEMBERSHIP IN `docker` IS EQUIVALENT TO ROOT. Anyone in it can run
+# `docker run -v /:/host`, write to the host filesystem as root and take the
+# machine over without ever using sudo. The Ansible login user is therefore
+# never added here — the stack roles run as root and compose files are owned
+# by the deploy owner, which is the only account in this group.
+#
+# The deploy owner is added because it owns the stack directories and the
+# containers. Keep this list as short as possible and review it whenever the
+# access model changes.
+docker_socket_groups:
+  - "{{ base_deploy_owner_user }}"
+
+# Old images accumulate on every deploy because the stack roles use
+# `pull: always`. Prune images unused for a week so a rolling set of Frappe
+# versions cannot fill the root filesystem. The 168h floor guarantees a
+# rollback target always exists.
+docker_prune_enabled: true
+docker_prune_images_after: 168h
+
+docker_daemon_options:
+  # Cap log growth. Matches the per-service `logging` options in the compose
+  # files; this is the host-level backstop for anything that does not set
+  # them (a container run by hand, for example).
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: '3'
+  # Keep containers running across a daemon restart or upgrade. Without this,
+  # a `systemctl restart docker` (or an unattended docker upgrade) silently
+  # kills every Frappe worker mid-request.
+  live-restore: true
+  # Containers cannot gain privileges through setuid/setgid binaries.
+  no-new-privileges: true
+  # Log every event to the journal so Docker activity shows up in the same
+  # place as the rest of the host audit trail.
+  log-level: info
+  # Explicit data-root: keeps container state off the default path so backups
+  # and disk checks know where it lives.
+  data-root: /var/lib/docker
+  # Default bridge address pool sized away from the RFC1918 ranges Cloudflare
+  # and common corporate networks use, to shrink the chance of a routing
+  # conflict.
+  default-address-pools:
+    - base: 172.30.0.0/16
+      size: 24

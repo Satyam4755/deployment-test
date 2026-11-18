@@ -1,0 +1,31 @@
+---
+# Standalone Traefik deployment — Phase 1 of the edge stack.
+# Local usage (no stored credentials — passwords are typed per run):
+#   printf 'vault-pass' > /tmp/vault_pass && chmod 600 /tmp/vault_pass
+#   printf 'sudo-pass'  > /tmp/become_pass && chmod 600 /tmp/become_pass
+#   ansible-playbook -i inventory/inventory.yml \
+#     --limit development -e target_env=development \
+#     --vault-id dev@/tmp/vault_pass \
+#     --become-password-file /tmp/become_pass \
+#     --private-key ~/.ssh/id_deploy playbooks/traefik.yml --check --diff
+#   shred -u /tmp/vault_pass /tmp/become_pass
+# SSH connects as the low-priv login user (group_vars/all ansible_user),
+# then escalates via sudo to root with the admin's own password. Stack files
+# are owned by deploy_owner_user explicitly.
+- name: Guard target environment
+  import_playbook: guard.yml
+
+- name: Deploy Traefik edge stack
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Ensure the stack base directory exists
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ deploy_owner_user }}"
+        group: "{{ deploy_owner_user }}"
+  roles:
+    - role: traefik

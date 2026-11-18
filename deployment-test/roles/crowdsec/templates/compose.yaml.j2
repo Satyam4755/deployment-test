@@ -1,0 +1,69 @@
+services:
+  crowdsec:
+    image: {{ crowdsec_image | default('crowdsecurity/crowdsec:v1.8.2') }} # pinned; never latest
+    container_name: crowdsec
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - LOCAL_API_URL={{ crowdsec_lapi_url | default('http://127.0.0.1:8080') }}
+    dns:
+{% for dns in crowdsec_dns_servers | default(['1.1.1.1', '1.0.0.1']) %}
+      - "{{ dns }}"
+{% endfor %}
+    # Ports: LAPI published ONLY on host loopback 127.0.0.1:8080.
+    # AppSec (7422) stays internal on crowdsec-net - NO host port.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - crowdsec-db:/var/lib/crowdsec/data/
+      - crowdsec-config:/etc/crowdsec/
+      # Traefik writes its logs into the traefik-logs named volume; mount the
+      # same volume read-only so CrowdSec's stream parser sees the access log.
+      - traefik-logs:/var/log/traefik:ro
+      # Host SSH authentication log - mounted read-only at /logs/auth.log
+      # The acquisition file references this container path.
+      - /var/log/auth.log:/logs/auth.log:ro
+      # Acquisition files. Mount the directory writable: the image prepares and
+      # chowns /etc/crowdsec on boot, and a read-only submount aborts startup.
+      - ./acquis.d:/etc/crowdsec/acquis.d
+      # Empty acquisition file replaces the nginx and syslog sources the image ships with
+      - ./acquis.yaml:/etc/crowdsec/acquis.yaml
+      # Profiles configuration - remediation policy and Telegram notifications
+      - ./profiles.yaml:/etc/crowdsec/profiles.yaml
+{% if crowdsec_telegram_enabled | default(true) %}
+      # Telegram notification - root-only, readable by the container process
+      - ./telegram.yaml:/etc/crowdsec/notifications/telegram.yaml
+{% endif %}
+    healthcheck:
+      # The official image ships cscli; this is the supported readiness probe.
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      # Must be the same network Traefik uses to reach the LAPI on port 8080.
+      # It is deliberately NOT the edge network the app containers use.
+      - crowdsec-net
+    # Runs as root, the image default. The entrypoint prepares root-owned
+    # volumes, registers the machine and reads /var/log/auth.log (0640 root:adm).
+    # Do not force user: "1000:1000" - that cannot write those paths.
+
+volumes:
+  crowdsec-db:
+  crowdsec-config:
+  # External volume created by the traefik role; shared, not managed here.
+  traefik-logs:
+    external: true
+    name: traefik-logs
+
+networks:
+  crowdsec-net:
+    name: {{ crowdsec_network | default('crowdsec-net') }}
+    external: true

@@ -1,0 +1,191 @@
+---
+# Install and schedule offsite backups. A backup role that is not actually
+# wired to a timer is decoration, so this installs both the script and the
+# systemd unit/timer that runs it.
+
+- name: Fail if backup credentials are missing
+  ansible.builtin.assert:
+    that:
+      - backup_access_key_id | length > 0
+      - backup_secret_access_key | length > 0
+    fail_msg: >-
+      Set vault_backup_access_key_id and vault_backup_secret_access_key in
+      group_vars/{{ env_name }}/vault.yml, or set backup_enabled: false.
+    quiet: true
+  when: backup_enabled | bool
+  no_log: true
+  tags: [backup]
+
+- name: Install rclone
+  # The official deb, not apt: rclone is not in the Ubuntu archive at a version
+  # that matters here, and the install is unattended.
+  when: backup_enabled | bool
+  tags: [backup]
+  block:
+    - name: Detect the rclone architecture
+      ansible.builtin.command:
+        cmd: dpkg --print-architecture
+      register: backup_arch
+      changed_when: false
+
+    - name: Download the rclone deb
+      ansible.builtin.get_url:
+        url: "https://downloads.rclone.org/rclone-current-linux-{{ backup_arch.stdout | trim }}.deb"
+        dest: /tmp/rclone.deb
+        mode: '0644'
+      register: backup_rclone_download
+      until: backup_rclone_download is succeeded
+      retries: 3
+      delay: 10
+
+    - name: Install the rclone deb
+      ansible.builtin.apt:
+        deb: /tmp/rclone.deb
+        state: present
+
+    - name: Remove the downloaded deb
+      ansible.builtin.file:
+        path: /tmp/rclone.deb
+        state: absent
+
+- name: Ensure the rclone configuration directory exists
+  # `template` does not create parent directories. Without this the first
+  # backup install fails with "Destination directory does not exist".
+  ansible.builtin.file:
+    path: /root/.config/rclone
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: backup_enabled | bool
+  tags: [backup]
+
+- name: Configure the rclone remote
+  ansible.builtin.template:
+    src: rclone.conf.j2
+    dest: /root/.config/rclone/rclone.conf
+    # Holds the object storage secret key.
+    mode: '0600'
+    owner: root
+    group: root
+  no_log: true
+  when: backup_enabled | bool
+  tags: [backup]
+
+- name: Ensure the local staging directory exists
+  # 0700: the dump and the sites tar contain production data.
+  ansible.builtin.file:
+    path: "{{ backup_local_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: backup_enabled | bool
+  tags: [backup]
+
+- name: Install the systemd service and timer
+  when: backup_enabled | bool
+  tags: [backup]
+  block:
+    - name: Install the backup systemd service
+      ansible.builtin.template:
+        src: erp-backup.service.j2
+        dest: /etc/systemd/system/erp-backup.service
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Install the backup systemd timer
+      ansible.builtin.template:
+        src: erp-backup.timer.j2
+        dest: /etc/systemd/system/erp-backup.timer
+        mode: '0644'
+      notify: Reload systemd
+
+- name: Install the backup script
+  ansible.builtin.template:
+    src: backup.sh.j2
+    dest: /usr/local/sbin/erp-backup
+    mode: '0755'
+    owner: root
+    group: root
+  when: backup_enabled | bool
+  tags: [backup]
+
+- name: Reload systemd before the verification run
+  # The units were just written. Flushing here, rather than at the end of the
+  # play, guarantees the service definition is loaded before it is started.
+  ansible.builtin.meta: flush_handlers
+  tags: [backup]
+
+- name: Run a verification backup
+  # Every `backup.yml` run proves the backup works end to end. An untested
+  # backup is a hypothesis: if the credentials, bucket name or dump flags are
+  # wrong, this is where it shows, not at 03:17 on a Sunday when someone needs
+  # a restore. It runs before the timer is enabled, so a broken backup does not
+  # run unattended every night.
+  #
+  # `systemctl` rather than the systemd module because the exit code is needed
+  # to fail the playbook. The site itself is untouched.
+  ansible.builtin.command: # noqa command-instead-of-module
+    cmd: systemctl start erp-backup
+  register: backup_verification
+  changed_when: true
+  when:
+    - backup_enabled | bool
+    - not ansible_check_mode
+  tags: [backup]
+
+- name: Enable and start the backup timer
+  ansible.builtin.systemd:
+    name: erp-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: backup_enabled | bool
+  tags: [backup]
+
+- name: Report how to verify backups
+  ansible.builtin.debug:
+    msg:
+      - "Backup schedule: OnCalendar={{ backup_calendar }}"
+      - "Destination: {{ backup_remote_name }}:{{ backup_bucket }}/{{ env_name }}/<timestamp>/"
+      - "Retention: {{ backup_retention_days }} days remote, {{ backup_local_keep_days }} days local"
+      - "Verify the last run: journalctl -u erp-backup --since today"
+      - "Run one now:      systemctl start erp-backup"
+      - "Restore:          see docs/RUNBOOK.md"
+  when: backup_enabled | bool
+
+- name: Stop and disable the backup timer when backups are disabled
+  # `backup_enabled: false` is a deliberate stop, not a purge. The script,
+  # rclone configuration and existing backups stay in place.
+  ansible.builtin.systemd:
+    name: erp-backup.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: not (backup_enabled | bool)
+  tags: [backup]
+
+- name: Remove the backup timer and service units when backups are disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/erp-backup.timer
+    - /etc/systemd/system/erp-backup.service
+  when: not (backup_enabled | bool)
+  tags: [backup]
+
+- name: Reload systemd after removing the backup units
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: not (backup_enabled | bool)
+  tags: [backup]
+
+- name: Report that backups are disabled
+  ansible.builtin.debug:
+    msg:
+      - "backup_enabled is false for {{ env_name }}."
+      - "The timer and service units were removed; the script and existing backups were kept."
+  when: not (backup_enabled | bool)
+  tags: [backup]

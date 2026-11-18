@@ -1,0 +1,142 @@
+#!/bin/bash
+# Managed by Ansible (roles/backup/templates/backup.sh.j2). Local edits are
+# overwritten.
+#
+# Backs up the Frappe stack to S3-compatible object storage:
+#   1. a MariaDB logical dump
+#   2. a tar of the sites volume
+#
+# Both land in the same timestamped directory, because a restore needs them
+# together and a dump from Monday with a sites tar from Tuesday is worse than
+# useless: it silently produces a site whose database references files that
+# are not there.
+set -euo pipefail
+umask 077
+
+LOCAL_DIR="{{ backup_local_dir }}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="${LOCAL_DIR}/${STAMP}"
+REMOTE="{{ backup_remote_name }}:{{ backup_bucket }}/{{ env_name }}/${STAMP}"
+SITES_VOLUME="{{ backup_sites_volume }}"
+MARIADB_CONTAINER="mariadb-database"
+
+# Resolve the volume mountpoint through Docker. The data root is not always
+# /var/lib/docker: a host can move it, and a hardcoded path silently backs up
+# nothing (or the wrong directory) when it does.
+VOLUME_DATA="$(docker volume inspect --format '{% raw %}{{ .Mountpoint }}{% endraw %}' "${SITES_VOLUME}" 2>/dev/null || true)"
+if [ -z "${VOLUME_DATA}" ] || [ ! -d "${VOLUME_DATA}" ]; then
+    echo "ERROR: could not resolve the ${SITES_VOLUME} volume mountpoint" >&2
+    exit 1
+fi
+
+# Read the database name from site_config.json (no hardcoded "frappe" fallback)
+# The site_config.json is in the sites volume under the site directory.
+SITE_NAME="{{ site_name }}"
+DB_NAME=""
+if [ -f "${VOLUME_DATA}/${SITE_NAME}/site_config.json" ]; then
+    DB_NAME=$(grep '"db_name"' "${VOLUME_DATA}/${SITE_NAME}/site_config.json" | sed -E 's/.*"db_name": *"([^"]+)".*/\1/')
+fi
+if [ -z "${DB_NAME}" ]; then
+    echo "ERROR: Could not determine database name from site_config.json" >&2
+    exit 1
+fi
+
+log() { printf '%s [%s] %s\n' "$(date -u +%FT%TZ)" "$1" "${*:2}"; }
+
+cleanup_failed_run() {
+    if [ -n "${FAILED:-}" ]; then
+        log ERROR "backup failed; discarding partial run at ${RUN_DIR}"
+        rm -rf "${RUN_DIR}"
+        # Leave the exit code intact so systemd records the failure.
+        return 1
+    fi
+}
+
+main() {
+    mkdir -p "${RUN_DIR}"
+    chmod 0700 "${RUN_DIR}"
+
+    # --- 1. database ----------------------------------------------------
+    # The root password is read from the secret file mounted into the
+    # container. It never appears in the host process table or this script.
+    log INFO "dumping MariaDB database ${DB_NAME} to ${RUN_DIR}/mariadb.sql.gz"
+    # The database name is a positional argument, not part of the quoted
+    # command string. Appending it after the command would make it $0, which
+    # mariadb-dump never sees.
+    docker exec "${MARIADB_CONTAINER}" sh -c '
+        MYSQL_PWD="$(cat /run/secrets/db_root_password)" exec mariadb-dump -uroot \
+            {{ backup_mysqldump_extra_args | replace('\n', ' ') }} --databases "$1"
+        ' sh "${DB_NAME}" \
+        | gzip -9 > "${RUN_DIR}/mariadb.sql.gz"
+
+    # A gzip of an error message is still a valid gzip, so verify the dump
+    # actually contains a schema before trusting it. Capture the head first:
+    # `zcat | head` sends SIGPIPE to zcat, and with `pipefail` that would fail
+    # an otherwise good dump.
+    DUMP_HEAD="$(zcat "${RUN_DIR}/mariadb.sql.gz" 2>/dev/null | head -200 || true)"
+    if ! grep -qi 'CREATE TABLE' <<<"${DUMP_HEAD}"; then
+        FAILED=1
+        log ERROR "mariadb dump does not look like a dump; aborting"
+        cleanup_failed_run
+        return 1
+    fi
+
+    # --- 2. sites volume -------------------------------------------------
+    # Uploaded files, site config and installed apps. Without this the restore
+    # has an empty database.
+    if [ -d "${VOLUME_DATA}" ]; then
+        log INFO "archiving ${SITES_VOLUME} to ${RUN_DIR}/sites.tar.gz"
+        tar -C "${VOLUME_DATA}" -czf "${RUN_DIR}/sites.tar.gz" .
+    else
+        FAILED=1
+        log ERROR "sites volume data not found at ${VOLUME_DATA}; aborting"
+        cleanup_failed_run
+        return 1
+    fi
+
+    # A manifest, so a restore can check it is holding a matching pair.
+    cat > "${RUN_DIR}/manifest.json" <<EOF
+{
+  "environment": "{{ env_name }}",
+  "timestamp": "${STAMP}",
+  "domain": "{{ domain }}",
+  "site_name": "{{ site_name }}",
+  "db_name": "${DB_NAME}",
+  "erp_image": "{{ erp_image }}",
+  "erp_image_version": "{{ erp_image_version }}",
+  "mariadb_image": "{{ mariadb_image }}",
+  "contains": ["mariadb.sql.gz", "sites.tar.gz"]
+}
+EOF
+
+    # --- 3. upload -------------------------------------------------------
+    log INFO "uploading to ${REMOTE}"
+    rclone copy "${RUN_DIR}" "${REMOTE}" \
+        --storage-class "{{ backup_storage_class }}" \
+        --transfers 2 \
+        --checkers 4
+
+    # Verify the upload by listing the remote, not by trusting the exit code:
+    # a partial upload can return success in some failure modes.
+    REMOTE_COUNT="$(rclone lsf "${REMOTE}" --files-only | wc -l)"
+    if [ "${REMOTE_COUNT}" -lt 3 ]; then
+        FAILED=1
+        log ERROR "expected at least 3 objects remotely, found ${REMOTE_COUNT}"
+        cleanup_failed_run
+        return 1
+    fi
+    log INFO "uploaded ${REMOTE_COUNT} objects"
+
+    # --- 4. retention ----------------------------------------------------
+    log INFO "pruning remote backups older than {{ backup_retention_days }} days"
+    rclone delete "{{ backup_remote_name }}:{{ backup_bucket }}/{{ env_name }}" \
+        --min-age "{{ backup_retention_days }}d"
+
+    find "${LOCAL_DIR}" -mindepth 1 -maxdepth 1 -type d \
+        -mtime "+{{ backup_local_keep_days }}" -exec rm -rf {} +
+
+    log INFO "backup complete: ${REMOTE}"
+}
+
+FAILED=""
+main

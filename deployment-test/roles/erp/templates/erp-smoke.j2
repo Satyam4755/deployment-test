@@ -1,0 +1,156 @@
+#!/bin/bash
+# erp-smoke — verify the deployment is healthy.
+# Runs as root via sudo from the ci-deploy account.
+# Exits 0 on success, non-zero on failure.
+
+set -euo pipefail
+
+CONFIG_FILE="/etc/erp/deploy.conf"
+
+# Load configuration
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: Config file $CONFIG_FILE not found" >&2
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+# Containers that must stay up.
+LONG_RUNNING=(
+    traefik socket-proxy crowdsec mariadb-database
+    redis-cache redis-queue backend websocket frappe-frontend
+    queue-short queue-long scheduler
+)
+# One-shot services: success means exit code 0, not "running".
+ONE_SHOT=(asset-syncer configurator)
+
+check_containers() {
+    local failed=0 container
+    for container in "${LONG_RUNNING[@]}"; do
+        if ! docker ps --filter "name=^${container}$" --format '{{ '{{' }}.Names{{ '}}' }}' | grep -q "^${container}$"; then
+            echo "FAIL: Container $container is not running"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
+check_one_shot_services() {
+    local failed=0 container code
+    for container in "${ONE_SHOT[@]}"; do
+        if ! docker inspect "$container" >/dev/null 2>&1; then
+            echo "FAIL: One-shot container $container has never run"
+            failed=1
+            continue
+        fi
+        code=$(docker inspect --format '{{ '{{' }}.State.ExitCode{{ '}}' }}' "$container")
+        if [[ "$code" != "0" ]]; then
+            echo "FAIL: One-shot container $container exited with code $code"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
+check_edge_ping() {
+    if ! curl --silent --show-error --fail --max-time 10 \
+        --resolve "$DOMAIN:443:127.0.0.1" \
+        "https://$DOMAIN/api/method/ping" >/dev/null 2>&1; then
+        echo "FAIL: Edge ping failed"
+        return 1
+    fi
+    return 0
+}
+
+check_certificate() {
+    local cert_pem
+    cert_pem=$(echo | openssl s_client -connect 127.0.0.1:443 \
+        -servername "$DOMAIN" 2>/dev/null | openssl x509 2>/dev/null || true)
+
+    if [[ -z "$cert_pem" ]]; then
+        echo "FAIL: No certificate served for $DOMAIN"
+        return 1
+    fi
+
+    # Let's Encrypt puts the hostname in a SAN, not necessarily the CN, so
+    # check the certificate's hostname list rather than grepping the subject.
+    if ! echo "$cert_pem" | openssl x509 -noout -checkhost "$DOMAIN" 2>/dev/null \
+        | grep -q "does match"; then
+        echo "FAIL: Certificate is not valid for $DOMAIN"
+        return 1
+    fi
+
+    if echo | openssl s_client -connect 127.0.0.1:443 \
+        -servername "$DOMAIN" -verify_return_error 2>&1 \
+        | grep -q "Verify return code: 0"; then
+        return 0
+    fi
+
+    if [[ "${ENVIRONMENT:-development}" == "production" ]]; then
+        echo "FAIL: Production certificate is not publicly trusted"
+        return 1
+    fi
+
+    echo "WARN: Certificate uses the staging CA (development)"
+    return 0
+}
+
+check_bouncer_registration() {
+    local bouncers
+    bouncers=$(docker exec crowdsec cscli bouncers list -o json 2>/dev/null || true)
+
+    if ! grep -qE '"name"[[:space:]]*:[[:space:]]*"traefik"' <<<"$bouncers"; then
+        echo "FAIL: Traefik bouncer not registered"
+        return 1
+    fi
+    if ! grep -qE '"name"[[:space:]]*:[[:space:]]*"firewall-host"' <<<"$bouncers"; then
+        echo "FAIL: Host firewall bouncer not registered"
+        return 1
+    fi
+
+    # The same call the Traefik plugin makes, from the same container and key.
+    if ! docker exec traefik sh -c \
+        'wget -qO- --header="X-Api-Key: $(cat /run/secrets/crowdsec_lapi_key)" http://crowdsec:8080/v1/decisions' \
+        >/dev/null 2>&1; then
+        echo "FAIL: Bouncer key rejected by LAPI"
+        return 1
+    fi
+    return 0
+}
+
+check_appsec() {
+    # AppSec listens on crowdsec-net:7422. Traefik is the only consumer.
+    # Any HTTP response proves the listener is reachable; a GET without the
+    # required headers can legitimately be answered with 4xx, so only a
+    # connection/protocol failure should count here.
+    if ! docker exec traefik sh -c \
+        'wget -S --spider http://crowdsec:7422/ 2>&1 | grep -q "HTTP/"'; then
+        echo "FAIL: AppSec listener not reachable from traefik"
+        return 1
+    fi
+    return 0
+}
+
+cd "$APP_DIR"
+
+echo "Running smoke checks..."
+
+check_containers || exit 1
+echo "PASS: All long-running containers running"
+
+check_one_shot_services || exit 1
+echo "PASS: One-shot services completed successfully"
+
+check_edge_ping || exit 1
+echo "PASS: Edge ping successful"
+
+check_certificate || exit 1
+echo "PASS: Certificate valid for $DOMAIN"
+
+check_bouncer_registration || exit 1
+echo "PASS: Bouncers registered and key valid"
+
+check_appsec || exit 1
+echo "PASS: AppSec reachable"
+
+echo "All smoke checks passed"
+exit 0

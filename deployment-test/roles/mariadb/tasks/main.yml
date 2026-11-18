@@ -1,0 +1,104 @@
+---
+- name: Fail if placeholder database secrets are used
+  # A missing vault key counts as a placeholder, so we fail with a clear
+  # message rather than an undefined-variable error.
+  ansible.builtin.fail:
+    msg: >-
+      Deployment aborted: set real vault values for {{ env_name | default('this env') }}
+      (vault_db_root_password, vault_db_encryption_key, vault_db_key_password).
+  when:
+    - db_root_password | default('', true) | length == 0 or
+      db_root_password | default('', true) is match('^CHANGE_ME') or
+      db_encryption_key | default('', true) | length == 0 or
+      db_encryption_key | default('', true) is match('^CHANGE_ME') or
+      db_key_password | default('', true) | length == 0 or
+      db_key_password | default('', true) is match('^CHANGE_ME')
+
+- name: Create mariadb directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/mariadb"
+    state: directory
+    mode: '0755'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Create mariadb secrets directory
+  ansible.builtin.file:
+    path: "{{ base_dir }}/mariadb/secrets"
+    state: directory
+    mode: '0700'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Write MariaDB root password secret
+  # Mounted as MARIADB_ROOT_PASSWORD_FILE; never in environment or .env
+  ansible.builtin.template:
+    src: db_root_password.j2
+    dest: "{{ base_dir }}/mariadb/secrets/db_root_password"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+
+- name: Ensure ACL utilities are installed
+  ansible.builtin.apt:
+    name: acl
+    state: present
+    update_cache: false
+
+- name: Allow Frappe to traverse deployment directory
+  ansible.posix.acl:
+    path: "{{ base_dir }}"
+    entity: "1000"
+    etype: user
+    permissions: x
+    state: present
+
+- name: Allow Frappe to traverse deploy owner's home
+  ansible.posix.acl:
+    path: "/home/{{ deploy_owner_user }}"
+    entity: "1000"
+    etype: user
+    permissions: x
+    state: present
+
+- name: Allow Frappe to access MariaDB secrets directory
+  ansible.posix.acl:
+    path: "{{ base_dir }}/mariadb/secrets"
+    entity: "1000"
+    etype: user
+    permissions: x
+    state: present
+
+- name: Allow Frappe to read database root password
+  ansible.posix.acl:
+    path: "{{ base_dir }}/mariadb/secrets/db_root_password"
+    entity: "1000"
+    etype: user
+    permissions: r
+    state: present
+  no_log: true
+
+- name: Template mariadb secrets env file
+  ansible.builtin.template:
+    src: mariadb.env.j2
+    dest: "{{ base_dir }}/mariadb/.env"
+    mode: '0600'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+  no_log: true
+
+- name: Template mariadb compose (canonical compose.yaml)
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ base_dir }}/mariadb/compose.yaml"
+    mode: '0644'
+    owner: "{{ deploy_owner_user }}"
+    group: "{{ deploy_owner_user }}"
+
+- name: Start mariadb
+  community.docker.docker_compose_v2:
+    project_src: "{{ base_dir }}/mariadb"
+    state: present
+    pull: always
+  when: not ansible_check_mode

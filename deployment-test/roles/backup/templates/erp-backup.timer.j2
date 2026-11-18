@@ -1,0 +1,19 @@
+[Unit]
+# Managed by Ansible (roles/backup).
+Description=Run the Frappe stack backup on a schedule
+
+[Timer]
+# systemd requires a full date specification here. A bare "03:17" is
+# rejected with "Invalid calendar specification", so the wildcard day and
+# month are explicit. Override backup_calendar in group_vars/<env>/ to change
+# the schedule, e.g. "Sun *-*-* 02:00:00" for weekly.
+OnCalendar={{ backup_calendar }}
+# If the host was off at the scheduled time, run as soon as it is back rather
+# than silently skipping a day.
+Persistent={{ 'true' if backup_persistent | bool else 'false' }}
+# Spread the start so many hosts do not all hit object storage at once.
+RandomizedDelaySec=15m
+Unit=erp-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,115 @@
+---
+# Creates the ci-deploy pipeline identity. This account has one purpose:
+# run the two root-owned deployment scripts (erp-deploy, erp-smoke).
+# It has no vault password, no sudo password, and cannot get root through
+# any other command.
+#
+# This file is included only when ci_deploy_registered is true, i.e. once a
+# real public key is in ci_deploy_authorized_keys. users.yml uses the same
+# flag for AllowUsers, so account and sshd entry are created together.
+
+- name: Assert ci-deploy key is provided
+  ansible.builtin.assert:
+    that:
+      - ci_deploy_authorized_keys | length > 0
+      - ci_deploy_authorized_keys | select('match', '^ssh-') | list | length == ci_deploy_authorized_keys | length
+    fail_msg: >-
+      vault_ci_deploy_authorized_keys must be a non-empty list of SSH public
+      keys in group_vars/{{ env_name }}/vault.yml. Generate the key pair first
+      (see SECRETS.md#generating-the-ci-key).
+    quiet: true
+  tags: [base, ci_deploy]
+
+- name: Create ci-deploy user
+  ansible.builtin.user:
+    name: "{{ ci_deploy_user }}"
+    shell: /bin/bash
+    groups: []
+    append: false
+    create_home: true
+    home: "/home/{{ ci_deploy_user }}"
+    state: present
+    password_lock: true
+  tags: [base, ci_deploy]
+
+- name: Ensure ci-deploy ssh directory exists
+  ansible.builtin.file:
+    path: "/home/{{ ci_deploy_user }}/.ssh"
+    state: directory
+    owner: "{{ ci_deploy_user }}"
+    group: "{{ ci_deploy_user }}"
+    mode: '0700'
+  tags: [base, ci_deploy]
+
+- name: Install ci-deploy authorized keys
+  # exclusive: true replaces the file, so a rotated key is genuinely revoked.
+  ansible.builtin.copy:
+    dest: "/home/{{ ci_deploy_user }}/.ssh/authorized_keys"
+    owner: "{{ ci_deploy_user }}"
+    group: "{{ ci_deploy_user }}"
+    mode: '0600'
+    exclusive: true
+    content: |
+      # Managed by Ansible (roles/base). Edits are overwritten.
+      {% for key in ci_deploy_authorized_keys %}
+      {{ key }}
+      {% endfor %}
+  tags: [base, ci_deploy]
+
+- name: Install ci-deploy restricted sudo rule
+  # ci-deploy can run ONLY the two deployment scripts as root. No other
+  # command is permitted. This is the entire Lane 2 attack surface.
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/ci-deploy
+    mode: '0440'
+    content: |
+      # Managed by Ansible (roles/base).
+      # ci-deploy may run ONLY the two deployment scripts as root.
+      # No password, no other commands, no shell access.
+      # The two DEPLOY_* variables carry the GitHub actor and run URL into the
+      # host audit record. They are logging metadata, not authority.
+      Defaults:{{ ci_deploy_user }} env_keep += "DEPLOY_ACTOR DEPLOY_RUN_URL"
+      Cmnd_Alias ERP_DEPLOY = /usr/local/bin/erp-deploy, /usr/local/bin/erp-smoke
+      {{ ci_deploy_user }} ALL=(root) NOPASSWD: ERP_DEPLOY
+    validate: /usr/sbin/visudo -cf %s
+  notify: Reload sudo
+  tags: [base, ci_deploy]
+
+- name: Verify ci-deploy sudo rule is exactly as intended
+  ansible.builtin.command:
+    cmd: sudo -l -U {{ ci_deploy_user }}
+  register: ci_deploy_sudo_check
+  changed_when: false
+  failed_when: false
+  tags: [base, ci_deploy]
+
+- name: Assert ci-deploy has only the two deployment commands
+  ansible.builtin.assert:
+    that:
+      - "'/usr/local/bin/erp-deploy' in ci_deploy_sudo_check.stdout"
+      - "'/usr/local/bin/erp-smoke' in ci_deploy_sudo_check.stdout"
+      # A broad grant would show `ALL`. The two scripts and their metadata
+      # Defaults line are the whole rule.
+      - "ci_deploy_sudo_check.stdout is not search('ALL')"
+    fail_msg: >-
+      ci-deploy sudo rule grants unexpected commands. Output:
+      {{ ci_deploy_sudo_check.stdout }}
+    quiet: true
+  tags: [base, ci_deploy]
+
+- name: Assert ci-deploy has no supplementary groups
+  ansible.builtin.command:
+    cmd: id -nG {{ ci_deploy_user }}
+  register: ci_deploy_groups
+  changed_when: false
+  failed_when: false
+  tags: [base, ci_deploy]
+
+- name: Fail if ci-deploy has any groups
+  ansible.builtin.fail:
+    msg: >-
+      ci-deploy has supplementary groups: {{ ci_deploy_groups.stdout }}.
+      It must have no groups.
+    quiet: true
+  when: ci_deploy_groups.stdout | length > 0
+  tags: [base, ci_deploy]

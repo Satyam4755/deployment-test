@@ -1,0 +1,39 @@
+# Telegram HTTP notification plugin configuration.
+# Mode 0600 root: the container runs as root and reads this file.
+# The bot token is part of the Telegram API URL - must not appear in logs.
+#
+# CrowdSec 1.8's HTTP plugin evaluates format as a Go template. Sprig's toJson
+# encodes the complete Telegram payload, including attacker-controlled values.
+type: http
+name: telegram
+url: "https://api.telegram.org/bot{{ crowdsec_telegram_bot_token }}/sendMessage"
+method: POST
+headers:
+  Content-Type: application/json
+format: |
+  {{ '{{' }}- $rows := list -{{ '}}' }}
+  {{ '{{' }}- range $i, $a := . -{{ '}}' }}
+  {{ '{{' }}- if lt $i 5 -{{ '}}' }}
+  {{ '{{' }}- $method := $a.GetMeta "method" -{{ '}}' }}
+  {{ '{{' }}- if not $method -{{ '}}' }}{{ '{{' }}- $verbs := GetMeta $a "http_verb" -{{ '}}' }}{{ '{{' }}- if gt (len $verbs) 0 -{{ '}}' }}{{ '{{' }}- $method = index $verbs 0 -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- $rawPath := $a.GetMeta "target_uri" -{{ '}}' }}
+  {{ '{{' }}- if not $rawPath -{{ '}}' }}{{ '{{' }}- $uris := GetMeta $a "uri" -{{ '}}' }}{{ '{{' }}- if gt (len $uris) 0 -{{ '}}' }}{{ '{{' }}- $rawPath = index $uris 0 -{{ '}}' }}{{ '{{' }}- else -{{ '}}' }}{{ '{{' }}- $paths := GetMeta $a "http_path" -{{ '}}' }}{{ '{{' }}- if gt (len $paths) 0 -{{ '}}' }}{{ '{{' }}- $rawPath = index $paths 0 -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- $path := regexReplaceAll "[[:cntrl:]]" (regexFind "^[^?]*" $rawPath) " " | trunc 80 -{{ '}}' }}
+  {{ '{{' }}- $rule := $a.GetMeta "rules" -{{ '}}' }}
+  {{ '{{' }}- if not $rule -{{ '}}' }}{{ '{{' }}- $rules := GetMeta $a "rule_name" -{{ '}}' }}{{ '{{' }}- if gt (len $rules) 0 -{{ '}}' }}{{ '{{' }}- $rule = index $rules 0 -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- $rule = regexReplaceAll "[[:cntrl:]]" $rule " " | trunc 60 -{{ '}}' }}
+  {{ '{{' }}- $line := printf "%s %s | %s | %d events" ($a.GetScope) (regexReplaceAll "[[:cntrl:]]" ($a.GetValue) " " | trunc 80) (regexReplaceAll "[[:cntrl:]]" ($a.GetScenario) " " | trunc 80) ($a.GetEventsCount) -{{ '}}' }}
+  {{ '{{' }}- if $a.Source -{{ '}}' }}{{ '{{' }}- if $a.Source.Cn -{{ '}}' }}{{ '{{' }}- $line = printf "%s | country=%s" $line (regexReplaceAll "[[:cntrl:]]" $a.Source.Cn " " | trunc 40) -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- if $a.Source.AsName -{{ '}}' }}{{ '{{' }}- $line = printf "%s | asn=%s" $line (regexReplaceAll "[[:cntrl:]]" $a.Source.AsName " " | trunc 80) -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- if or $method $path -{{ '}}' }}{{ '{{' }}- $line = printf "%s | http=%s %s" $line (regexReplaceAll "[[:cntrl:]]" $method " " | trunc 12) $path -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- if $rule -{{ '}}' }}{{ '{{' }}- $line = printf "%s | rule=%s" $line $rule -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- $actions := list -{{ '}}' }}
+  {{ '{{' }}- range $d := $a.Decisions -{{ '}}' }}{{ '{{' }}- $actions = append $actions (printf "%s %s" $d.Type $d.Duration) -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- if gt (len $actions) 0 -{{ '}}' }}{{ '{{' }}- $line = printf "%s | action=%s" $line (join ", " $actions) -{{ '}}' }}{{ '{{' }}- else -{{ '}}' }}{{ '{{' }}- $line = printf "%s | alert-only" $line -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- $rows = append $rows $line -{{ '}}' }}
+  {{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- if gt (len .) 5 -{{ '}}' }}{{ '{{' }}- $rows = append $rows (printf "%d additional alerts omitted" (sub (len .) 5)) -{{ '}}' }}{{ '{{' }}- end -{{ '}}' }}
+  {{ '{{' }}- dict "chat_id" "{{ crowdsec_telegram_chat_id }}" "text" (join "\n---\n" $rows | trunc 1800) | toJson -{{ '}}' }}
+group_wait: 30s
+group_threshold: 5
+max_retry: 3
