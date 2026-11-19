@@ -58,10 +58,40 @@ services:
         # Build assets only if needed. Asset validation is based on actual
         # asset availability on disk, not only a version marker. If the marker
         # is missing or any required assets are missing from the volume or
-        # container, bench build --production is executed.
+        # container, asset compilation is executed.
         if [ -f "$${MARKER}" ] && validate_assets "/mnt/assets_vol" 0 && validate_assets "/home/frappe/frappe-bench/sites/assets" 0; then
           echo "Assets already built and verified for $${VERSION}; skipping bench build.";
         else
+          python3 - <<'PY'
+        import json
+        import os
+        import tempfile
+        path = "/home/frappe/frappe-bench/sites/common_site_config.json"
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, "r") as f:
+                config = json.load(f)
+        else:
+            config = {}
+        config.setdefault("socketio_port", 9000)
+        fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".common_site_config.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(config, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+        with open(path, "r") as f:
+            verified = json.load(f)
+        assert verified.get("socketio_port") == 9000, "socketio_port configuration failed"
+        print("Verified socketio_port:", verified["socketio_port"])
+        PY
           echo "Marker missing or required assets not present for $${VERSION}; running bench build --production.";
           bench build --production;
         fi
