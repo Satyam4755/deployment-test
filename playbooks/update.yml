@@ -7,59 +7,52 @@
 # that deploys both environments in a single run, because a failed image bump
 # should be caught in development while it is still cheap.
 #
-# The image identity is a sha256 digest, passed with
-# -e erp_image=sha256:<digest> (a full repo@sha256:<digest> is also
-# accepted). erp_image_version is only a human-readable label for records
-# and the asset marker; it is not the identity of the image (ADR-004).
+# The image identity is a semantic version tag, passed with
+# -e erp_image_version=<version> (e.g. -e erp_image_version=1.16.11).
+# Pinned version tags are required; 'latest' is forbidden.
 #
 #   # 1. development, dry run
 #   ansible-playbook -i inventory/inventory.yml --limit development \
-#     -e target_env=development -e erp_image=sha256:<digest> \
+#     -e target_env=development -e erp_image_version=1.16.11 \
 #     --vault-id dev@/tmp/vault_pass playbooks/update.yml --check --diff
 #
 #   # 2. development, for real
 #   ansible-playbook -i inventory/inventory.yml --limit development \
-#     -e target_env=development -e erp_image=sha256:<digest> \
+#     -e target_env=development -e erp_image_version=1.16.11 \
 #     --vault-id dev@/tmp/vault_pass playbooks/update.yml
 #
 #   # 3. smoke test (playbooks/smoke.yml runs automatically at the end)
 #
 #   # 4. production, only after 2 and 3 look right
 #   ansible-playbook -i inventory/inventory.yml --limit production \
-#     -e target_env=production -e erp_image=sha256:<digest> \
+#     -e target_env=production -e erp_image_version=1.16.11 \
 #     --vault-id prod@/tmp/vault_pass playbooks/update.yml
 #
-# A production deploy passes the same digest with -e; no value in this
+# A production deploy passes the same version with -e; no value in this
 # repository changes, so a one-off rollout never alters the committed default.
 - name: Guard target environment
   import_playbook: guard.yml
 
-- name: Preflight the requested image digest
+- name: Preflight the requested image version
   hosts: all
   become: false
   gather_facts: false
   tasks:
-    - name: Validate the requested image identity
-      # A tag is not a release identity: it can be repointed. Only a digest
-      # pins the exact bytes that ran in development.
+    - name: Validate the requested image version
       ansible.builtin.assert:
         that:
-          - erp_image is defined
-          - erp_image is match('^(sha256:[a-f0-9]{64}|.+@sha256:[a-f0-9]{64})$')
+          - erp_image_version is defined
+          - erp_image_version != 'latest'
+          - erp_image_version is match('^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
         fail_msg: >-
-          erp_image must be a sha256 digest (sha256:<64 hex chars>) or a
-          repo@sha256:<digest> reference. Got
-          '{{ erp_image | default("<unset>") }}'.
+          erp_image_version must be defined as a valid semantic version
+          (e.g. '1.16.11'). The tag 'latest' is forbidden. Got
+          '{{ erp_image_version | default("<unset>") }}'.
         quiet: true
 
-    - name: Extract the digest
+    - name: Construct the full image reference
       ansible.builtin.set_fact:
-        requested_digest: "{{ erp_image | regex_search('sha256:[a-f0-9]{64}') }}"
-
-    - name: Pin the image and label the build
-      ansible.builtin.set_fact:
-        erp_image: "{{ erp_image_repository }}@{{ requested_digest }}"
-        erp_image_version: "{{ erp_build_label | default(requested_digest[7:19]) }}"
+        erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
 
     - name: Report what is currently running
       community.docker.docker_container_info:

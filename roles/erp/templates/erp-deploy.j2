@@ -1,7 +1,7 @@
 #!/bin/bash
-# erp-deploy — deploy a new application image by digest.
+# erp-deploy — deploy a new application image by version tag.
 # Runs as root via sudo from the ci-deploy account.
-# Usage: erp-deploy <sha256:digest>
+# Usage: erp-deploy <version>
 
 set -euo pipefail
 
@@ -17,15 +17,20 @@ source "$CONFIG_FILE"
 
 # Validate arguments
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <sha256:digest>" >&2
+    echo "Usage: $0 <version>" >&2
     exit 1
 fi
 
-DIGEST="$1"
+VERSION="$1"
 
-# Validate digest format
-if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-    echo "ERROR: Invalid digest format. Must be sha256:<64 hex chars>" >&2
+# Validate version format (semver required, latest forbidden)
+if [[ "$VERSION" == "latest" ]]; then
+    echo "ERROR: Deploying tag 'latest' is forbidden. Specify an explicit semantic version (e.g. 1.16.11)." >&2
+    exit 1
+fi
+
+if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    echo "ERROR: Invalid version format '$VERSION'. Must be a semantic version (e.g. 1.16.11)." >&2
     exit 1
 fi
 
@@ -50,32 +55,33 @@ record_deploy() {
     chmod 0600 "$DEPLOY_LOG"
     printf '%s environment=%s previous=%s new=%s actor=%s workflow_run=%s result=%s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        "${ENVIRONMENT:-unknown}" "${PREVIOUS_DIGEST:-none}" "$DIGEST" \
+        "${ENVIRONMENT:-unknown}" "${PREVIOUS_VERSION:-none}" "$VERSION" \
         "$ACTOR" "$WORKFLOW_RUN" "$result" >> "$DEPLOY_LOG"
 }
 
-PREVIOUS_DIGEST="none"
+PREVIOUS_VERSION="none"
 # A failed deploy is part of the record too. `success` clears the trap.
 trap 'record_deploy failure' EXIT
 
-log "=== Deploy started: digest=$DIGEST ==="
+log "=== Deploy started: version=$VERSION ==="
 log "App directory: $APP_DIR"
 log "Site name: $SITE_NAME"
 
 cd "$APP_DIR"
 
-# Update the image in compose file (replace tag or previous digest with the
-# digest). IMAGE_REPO is rendered by Ansible; there is no shell variable with
-# the image name at runtime.
+# Update the image in compose file. IMAGE_REPO is rendered by Ansible;
+# there is no shell variable with the image name at runtime.
 IMAGE_REPO="{{ erp_image_repository }}"
 
-# Record the digest that is running before the compose file is rewritten. The
-# first provisioning deploy still uses a tag, so `none` is the honest value.
-PREVIOUS_DIGEST="$(grep -oE "${IMAGE_REPO}@sha256:[a-f0-9]{64}" "$COMPOSE_FILE" | head -n1 | sed 's/.*@//' || true)"
-PREVIOUS_DIGEST="${PREVIOUS_DIGEST:-none}"
+# Record the version or reference running before the compose file is rewritten.
+PREVIOUS_VERSION="$(grep -oE "${IMAGE_REPO}[:@][^\"[:space:]]+" "$COMPOSE_FILE" | head -n1 | sed -E "s|${IMAGE_REPO}[:@]||" || true)"
+PREVIOUS_VERSION="${PREVIOUS_VERSION:-none}"
 
-log "Updating compose file with digest..."
-sed -i -E "s|image: \"?${IMAGE_REPO}[:@][^\"[:space:]]*\"?|image: \"${IMAGE_REPO}@${DIGEST}\"|g" "$COMPOSE_FILE"
+log "Updating compose file with image version..."
+sed -i -E "s|image: \"?${IMAGE_REPO}[:@][^\"[:space:]]*\"?|image: \"${IMAGE_REPO}:${VERSION}\"|g" "$COMPOSE_FILE"
+
+log "Updating asset-syncer VERSION in compose file..."
+sed -i -E "s|VERSION=\"[^\"]*\"|VERSION=\"${VERSION}\"|g" "$COMPOSE_FILE"
 
 # Pull the new image
 log "Pulling image..."
@@ -130,10 +136,8 @@ for i in {1..12}; do
 done
 
 # Record the deploy
-VERSION_LABEL="${DIGEST#sha256:}"
-VERSION_LABEL="${VERSION_LABEL:0:12}"
 record_deploy success
 trap - EXIT
-log "Deploy completed successfully: version=$VERSION_LABEL digest=$DIGEST"
+log "Deploy completed successfully: version=$VERSION"
 
 exit 0

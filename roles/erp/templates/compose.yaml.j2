@@ -13,17 +13,56 @@ services:
         MARKER="/mnt/assets_vol/.built-for-$${VERSION}"
         echo "Refreshing assets in anonymous volume (image version $${VERSION})...";
 
-        # `bench build --production` is the slowest step in the whole deploy
-        # and it depends only on the image contents. Because every service here
-        # depends_on service_completed_successfully, re-running it on every
-        # deploy blocked the entire stack for minutes even when nothing had
-        # changed. The marker makes the build a no-op unless the image version
-        # moved, and it is written *after* validation, so a half-finished build
-        # can never be mistaken for a good one.
-        if [ -f "$${MARKER}" ]; then
-          echo "Assets already built for $${VERSION}; skipping bench build.";
+        # Validate whether all assets referenced in assets.json exist on disk.
+        validate_assets() {
+          local dir="$$1"
+          local verbose="$${2:-0}"
+          python3 -c "
+        import json, os, sys
+        base_dir = sys.argv[1]
+        verbose = sys.argv[2] == '1'
+        manifest = os.path.join(base_dir, 'assets.json')
+        if not os.path.isfile(manifest):
+            if verbose:
+                print(f'ERROR: Manifest {manifest} not found!')
+            sys.exit(1)
+        try:
+            with open(manifest) as f:
+                assets = json.load(f)
+            if not assets or not isinstance(assets, dict):
+                if verbose:
+                    print(f'ERROR: Manifest {manifest} is empty or invalid!')
+                sys.exit(1)
+            missing = 0
+            for k, v in assets.items():
+                rel = v.replace('/assets/', '/').lstrip('/')
+                target = os.path.join(base_dir, rel)
+                if not os.path.exists(target):
+                    if verbose:
+                        print(f'ERROR: Asset {v} referenced in assets.json not found at {target}!')
+                    missing += 1
+            if missing > 0:
+                if verbose:
+                    print(f'Asset validation failed! {missing} missing files.')
+                sys.exit(1)
+        except Exception as e:
+            if verbose:
+                print(f'ERROR reading assets manifest: {e}')
+            sys.exit(1)
+        if verbose:
+            print('Asset validation passed successfully.')
+        sys.exit(0)
+        " "$$dir" "$$verbose"
+        }
+
+        # Build assets only if needed. Asset validation is based on actual
+        # asset availability on disk, not only a version marker. If the marker
+        # is missing or any required assets are missing from the volume or
+        # container, bench build --production is executed.
+        if [ -f "$${MARKER}" ] && validate_assets "/mnt/assets_vol" 0 && validate_assets "/home/frappe/frappe-bench/sites/assets" 0; then
+          echo "Assets already built and verified for $${VERSION}; skipping bench build.";
         else
-          echo "No marker for $${VERSION}; running bench build --production.";
+          echo "Marker missing or required assets not present for $${VERSION}; running bench build --production.";
           bench build --production;
         fi
 
@@ -36,23 +75,7 @@ services:
         fi;
 
         echo "Validating asset sync...";
-        python3 -c "
-        import json, os, sys
-        image_assets_path = '/home/frappe/frappe-bench/sites/assets'
-        volume_assets_path = '/mnt/assets_vol'
-        with open(f'{image_assets_path}/assets.json') as f:
-            assets = json.load(f)
-        missing = 0
-        for k, v in assets.items():
-            file_path = f'{volume_assets_path}' + v.replace('/assets/', '/')
-            if not os.path.exists(file_path):
-                print(f'ERROR: Asset {v} referenced in assets.json not found at {file_path}!')
-                missing += 1
-        if missing > 0:
-            print(f'Asset validation failed! {missing} missing files.')
-            sys.exit(1)
-        print('Asset validation passed successfully.')
-        "
+        validate_assets "/mnt/assets_vol" 1
 
         # Written only after validation passes.
         touch "$${MARKER}"

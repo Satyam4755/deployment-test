@@ -7,15 +7,15 @@ name: Deploy Application
 # - Production requires approval from a designated reviewer (no self-review).
 # - Production runs only when explicitly requested via workflow_dispatch.
 #   A development deployment never triggers or queues production.
-# - A rollback is a deploy of an older digest. There is no separate job.
+# - A rollback is a deploy of an older version tag. There is no separate job.
 
 on:
   repository_dispatch:
     types: [deploy]
   workflow_dispatch:
     inputs:
-      digest:
-        description: 'sha256 digest of the application image (e.g. sha256:a1b2c3...)'
+      version:
+        description: 'Semantic version tag of the application image (e.g. 1.16.11)'
         required: true
         type: string
       environment:
@@ -41,7 +41,7 @@ jobs:
     name: Prepare & Validate
     runs-on: ubuntu-latest
     outputs:
-      digest: ${{ steps.validate.outputs.digest }}
+      version: ${{ steps.validate.outputs.version }}
       environment: ${{ steps.validate.outputs.environment }}
       actor: ${{ steps.validate.outputs.actor }}
     steps:
@@ -54,17 +54,17 @@ jobs:
           # Event payloads are untrusted input. Pass them as environment
           # variables so the shell never parses their contents as code.
           EVENT_NAME: ${{ github.event_name }}
-          PAYLOAD_DIGEST: ${{ github.event.client_payload.digest }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
           PAYLOAD_ENVIRONMENT: ${{ github.event.client_payload.environment }}
           PAYLOAD_ACTOR: ${{ github.event.client_payload.actor }}
-          INPUT_DIGEST: ${{ github.event.inputs.digest }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
           INPUT_ENVIRONMENT: ${{ github.event.inputs.environment }}
           DEFAULT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            if [ -z "$PAYLOAD_DIGEST" ]; then
-              echo "::error::Missing client_payload.digest in repository_dispatch event"
+            if [ -z "$PAYLOAD_VERSION" ]; then
+              echo "::error::Missing client_payload.version in repository_dispatch event"
               exit 1
             fi
             if [ -z "$PAYLOAD_ENVIRONMENT" ]; then
@@ -75,19 +75,19 @@ jobs:
               echo "::error::Automated repository_dispatch can only deploy to 'development'. Received: '$PAYLOAD_ENVIRONMENT'"
               exit 1
             fi
-            DIGEST="$PAYLOAD_DIGEST"
+            VERSION="$PAYLOAD_VERSION"
             ENV="$PAYLOAD_ENVIRONMENT"
             ACTOR="${PAYLOAD_ACTOR:-$DEFAULT_ACTOR}"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -z "$INPUT_DIGEST" ]; then
-              echo "::error::Missing digest input in workflow_dispatch"
+            if [ -z "$INPUT_VERSION" ]; then
+              echo "::error::Missing version input in workflow_dispatch"
               exit 1
             fi
             if [ -z "$INPUT_ENVIRONMENT" ]; then
               echo "::error::Missing environment input in workflow_dispatch"
               exit 1
             fi
-            DIGEST="$INPUT_DIGEST"
+            VERSION="$INPUT_VERSION"
             ENV="$INPUT_ENVIRONMENT"
             ACTOR="$DEFAULT_ACTOR"
           else
@@ -95,9 +95,14 @@ jobs:
             exit 1
           fi
 
-          # Validate digest format
-          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::Invalid digest format: $DIGEST (must be sha256:<64 hex chars>)"
+          # Validate version format (semver required, latest forbidden)
+          if [ "$VERSION" = "latest" ]; then
+            echo "::error::The 'latest' tag is forbidden for deployments. Must be a semantic version (e.g. 1.16.11)"
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version format: '$VERSION'. Must be a valid semantic version (e.g. 1.16.11)"
             exit 1
           fi
 
@@ -106,7 +111,7 @@ jobs:
             exit 1
           fi
 
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
           echo "actor=$ACTOR" >> "$GITHUB_OUTPUT"
           {
@@ -114,12 +119,12 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Digest | \`$DIGEST\` |"
+            echo "| Version | \`$VERSION\` |"
             echo "| Environment | \`$ENV\` |"
             echo "| Trigger | ${{ github.event_name }} |"
             echo "| Actor | $ACTOR |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Validated: digest=$DIGEST environment=$ENV"
+          echo "Validated: version=$VERSION environment=$ENV"
 
   deploy-development:
     name: Deploy Development
@@ -179,7 +184,7 @@ jobs:
           TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
           CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
           SSH_PORT: ${{ vars.SSH_PORT }}
-          DIGEST: ${{ needs.prepare.outputs.digest }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
           DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -187,7 +192,7 @@ jobs:
           set +x
           # The ci-deploy sudo rule preserves only these two metadata
           # variables, which the host script writes to its audit log.
-          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $DIGEST"
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $VERSION"
           ssh -o StrictHostKeyChecking=accept-new \
             -i ~/.ssh/id_deploy \
             -p "$SSH_PORT" \
@@ -267,7 +272,7 @@ jobs:
           TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
           CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
           SSH_PORT: ${{ vars.SSH_PORT }}
-          DIGEST: ${{ needs.prepare.outputs.digest }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
           DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -275,7 +280,7 @@ jobs:
           set +x
           # The ci-deploy sudo rule preserves only these two metadata
           # variables, which the host script writes to its audit log.
-          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $DIGEST"
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy $VERSION"
           ssh -o StrictHostKeyChecking=accept-new \
             -i ~/.ssh/id_deploy \
             -p "$SSH_PORT" \
@@ -302,14 +307,14 @@ jobs:
     if: needs.deploy-production.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Publish the deployed digest
+      - name: Publish the deployed version
         run: |
           {
             echo "### Release deployed"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Digest | \`${{ needs.prepare.outputs.digest }}\` |"
+            echo "| Version | \`${{ needs.prepare.outputs.version }}\` |"
             echo "| Environment | \`${{ needs.prepare.outputs.environment }}\` |"
             echo "| Actor | \`${{ needs.prepare.outputs.actor }}\` |"
             echo "| Run | ${{ github.run_id }} |"

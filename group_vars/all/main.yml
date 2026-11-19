@@ -38,9 +38,9 @@ ansible_pipelining: true
 ansible_retries: 3
 
 # --- images ---
-# Pinned, never `latest`. `erp_image_version` is the provisioning default
-# and human-readable label. A deploy pins `erp_image` to a sha256 digest;
-# see playbooks/update.yml and ADR-004.
+# Pinned to an explicit version tag, never `latest`.
+# erp_image_version is the deployed semantic version (e.g. 1.16.11).
+# The image reference is constructed as repository:version.
 #
 # The image repository names the registry namespace the business owns, so it
 # is a confidential identifier and lives in the vault. See ADR-026.
