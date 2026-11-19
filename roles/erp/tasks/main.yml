@@ -126,6 +126,7 @@
     mode: '0755'
     owner: root
     group: root
+  tags: [erp, erp_scripts, deploy_scripts]
 
 - name: Install erp-smoke script
   ansible.builtin.template:
@@ -134,6 +135,7 @@
     mode: '0755'
     owner: root
     group: root
+  tags: [erp, erp_scripts, deploy_scripts]
 
 - name: Ensure deploy log exists
   ansible.builtin.file:
