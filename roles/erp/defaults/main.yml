@@ -3,7 +3,7 @@
 # is a confidential identifier and is defined once in group_vars/all/main.yml
 # as `{{ vault_app_image_repository }}`. The image reference is constructed as
 # repository:version, pinned to an explicit semantic version tag.
-erp_image_version: "1.16.9"
+erp_image_version: "1.16.14"
 erp_image: "{{ erp_image_repository }}:{{ erp_image_version }}"
 
 # --- initial site configuration -----------------------------------------
