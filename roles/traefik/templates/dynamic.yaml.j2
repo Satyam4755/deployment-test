@@ -84,7 +84,7 @@ http: # http dynamic config root; routers/middlewares applied per-router, never 
           X-Robots-Tag: "noindex, nofollow"
     frappe-csp: # frappe CSP; unsafe-inline/eval required by frappe UI build
       headers:
-        contentSecurityPolicy: "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:"
+        contentSecurityPolicy: "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com"
 tls: # TLS hardening block
   options:
     default:
