@@ -15,8 +15,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Semantic version tag of the application image (e.g. 1.16.11)'
-        required: true
+        description: 'Semantic version tag (e.g. 1.16.11 or v1.16.11) or sha256 digest'
+        required: false
+        type: string
+      digest:
+        description: 'Immutable Docker image digest (sha256:<64 hex characters>), alternative to version'
+        required: false
         type: string
       environment:
         description: 'Target environment for initial deploy'
@@ -41,7 +45,8 @@ jobs:
     name: Prepare & Validate
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.validate.outputs.version }}
+      image_ref: ${{ steps.validate.outputs.image_ref }}
+      ref_type: ${{ steps.validate.outputs.ref_type }}
       environment: ${{ steps.validate.outputs.environment }}
       actor: ${{ steps.validate.outputs.actor }}
     steps:
@@ -55,16 +60,22 @@ jobs:
           # variables so the shell never parses their contents as code.
           EVENT_NAME: ${{ github.event_name }}
           PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
+          PAYLOAD_DIGEST: ${{ github.event.client_payload.digest }}
           PAYLOAD_ENVIRONMENT: ${{ github.event.client_payload.environment }}
           PAYLOAD_ACTOR: ${{ github.event.client_payload.actor }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_DIGEST: ${{ github.event.inputs.digest }}
           INPUT_ENVIRONMENT: ${{ github.event.inputs.environment }}
           DEFAULT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            if [ -z "$PAYLOAD_VERSION" ]; then
-              echo "::error::Missing client_payload.version in repository_dispatch event"
+            if [ -n "$PAYLOAD_VERSION" ] && [ -n "$PAYLOAD_DIGEST" ]; then
+              echo "::error::Provide either client_payload.version or client_payload.digest in repository_dispatch, not both"
+              exit 1
+            fi
+            if [ -z "$PAYLOAD_VERSION" ] && [ -z "$PAYLOAD_DIGEST" ]; then
+              echo "::error::Missing client_payload.version or client_payload.digest in repository_dispatch event"
               exit 1
             fi
             if [ -z "$PAYLOAD_ENVIRONMENT" ]; then
@@ -75,19 +86,35 @@ jobs:
               echo "::error::Automated repository_dispatch can only deploy to 'development'. Received: '$PAYLOAD_ENVIRONMENT'"
               exit 1
             fi
-            VERSION="$PAYLOAD_VERSION"
+            if [ -n "$PAYLOAD_DIGEST" ]; then
+              RAW_REF="$PAYLOAD_DIGEST"
+              INPUT_SOURCE="digest"
+            else
+              RAW_REF="$PAYLOAD_VERSION"
+              INPUT_SOURCE="auto"
+            fi
             ENV="$PAYLOAD_ENVIRONMENT"
             ACTOR="${PAYLOAD_ACTOR:-$DEFAULT_ACTOR}"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -z "$INPUT_VERSION" ]; then
-              echo "::error::Missing version input in workflow_dispatch"
+            if [ -n "$INPUT_VERSION" ] && [ -n "$INPUT_DIGEST" ]; then
+              echo "::error::Provide either 'version' or 'digest' input in workflow_dispatch, not both"
+              exit 1
+            fi
+            if [ -z "$INPUT_VERSION" ] && [ -z "$INPUT_DIGEST" ]; then
+              echo "::error::Missing image input in workflow_dispatch: provide either 'version' or 'digest'"
               exit 1
             fi
             if [ -z "$INPUT_ENVIRONMENT" ]; then
               echo "::error::Missing environment input in workflow_dispatch"
               exit 1
             fi
-            VERSION="$INPUT_VERSION"
+            if [ -n "$INPUT_DIGEST" ]; then
+              RAW_REF="$INPUT_DIGEST"
+              INPUT_SOURCE="digest"
+            else
+              RAW_REF="$INPUT_VERSION"
+              INPUT_SOURCE="auto"
+            fi
             ENV="$INPUT_ENVIRONMENT"
             ACTOR="$DEFAULT_ACTOR"
           else
@@ -95,18 +122,33 @@ jobs:
             exit 1
           fi
 
-          # Strip optional leading 'v'
-          VERSION="${VERSION#v}"
+          # Validate either an immutable sha256 digest or a semantic version tag.
+          # A digest is never treated as a semantic version.
+          if [ "$INPUT_SOURCE" = "digest" ] || [[ "$RAW_REF" =~ ^[Ss][Hh][Aa]256: ]]; then
+            DIGEST="$(printf '%s' "$RAW_REF" | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid digest format: '$RAW_REF'. Must be 'sha256:' followed by 64 hexadecimal characters."
+              exit 1
+            fi
+            IMAGE_REF="$DIGEST"
+            REF_TYPE="digest"
+          else
+            # Strip optional leading 'v'
+            VERSION="${RAW_REF#v}"
 
-          # Validate version format (semver required, latest forbidden)
-          if [ "$VERSION" = "latest" ]; then
-            echo "::error::The 'latest' tag is forbidden for deployments. Must be a semantic version (e.g. 1.16.11)"
-            exit 1
-          fi
+            # Validate version format (semver required, latest forbidden)
+            if [ "$VERSION" = "latest" ]; then
+              echo "::error::The 'latest' tag is forbidden for deployments. Must be a semantic version (e.g. 1.16.11) or sha256 digest."
+              exit 1
+            fi
 
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Invalid version format: '$VERSION'. Must be a valid semantic version (e.g. 1.16.11)"
-            exit 1
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Invalid version or digest format: '$RAW_REF'. Must be a valid semantic version (e.g. 1.16.11 or v1.16.11) or sha256 digest (sha256:<64 hex chars>)."
+              exit 1
+            fi
+
+            IMAGE_REF="$VERSION"
+            REF_TYPE="version"
           fi
 
           if [[ ! "$ENV" =~ ^(development|production)$ ]]; then
@@ -114,20 +156,27 @@ jobs:
             exit 1
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "ref_type=$REF_TYPE" >> "$GITHUB_OUTPUT"
           echo "environment=$ENV" >> "$GITHUB_OUTPUT"
           echo "actor=$ACTOR" >> "$GITHUB_OUTPUT"
+          if [ "$REF_TYPE" = "digest" ]; then
+            SUMMARY_LABEL="Digest"
+          else
+            SUMMARY_LABEL="Version"
+          fi
           {
             echo "### Deploy summary"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Version | \`$VERSION\` |"
+            echo "| $SUMMARY_LABEL | \`$IMAGE_REF\` |"
+            echo "| Reference type | \`$REF_TYPE\` |"
             echo "| Environment | \`$ENV\` |"
             echo "| Trigger | ${{ github.event_name }} |"
             echo "| Actor | $ACTOR |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Validated: version=$VERSION environment=$ENV"
+          echo "Validated: ${REF_TYPE}=${IMAGE_REF} environment=${ENV}"
 
   deploy-development:
     name: Deploy Development
@@ -187,7 +236,7 @@ jobs:
           TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
           CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
           SSH_PORT: ${{ vars.SSH_PORT }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
           DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
           DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -195,7 +244,7 @@ jobs:
           set +x
           # The ci-deploy sudo rule preserves only these two metadata
           # variables, which the host script writes to its audit log.
-          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy \"$VERSION\""
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy \"$IMAGE_REF\""
           ssh -o StrictHostKeyChecking=accept-new \
             -i ~/.ssh/id_deploy \
             -p "$SSH_PORT" \
@@ -275,7 +324,7 @@ jobs:
           TARGET_SERVER_HOST: ${{ vars.TARGET_SERVER_HOST }}
           CI_DEPLOY_USER: ${{ vars.CI_DEPLOY_USER }}
           SSH_PORT: ${{ vars.SSH_PORT }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
           DEPLOY_ACTOR: ${{ needs.prepare.outputs.actor }}
           DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -283,7 +332,7 @@ jobs:
           set +x
           # The ci-deploy sudo rule preserves only these two metadata
           # variables, which the host script writes to its audit log.
-          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy \"$VERSION\""
+          REMOTE="DEPLOY_ACTOR=$(printf %q "$DEPLOY_ACTOR") DEPLOY_RUN_URL=$(printf %q "$DEPLOY_RUN_URL") sudo -n /usr/local/bin/erp-deploy \"$IMAGE_REF\""
           ssh -o StrictHostKeyChecking=accept-new \
             -i ~/.ssh/id_deploy \
             -p "$SSH_PORT" \
@@ -310,14 +359,15 @@ jobs:
     if: needs.deploy-production.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Publish the deployed version
+      - name: Publish the deployed reference
         run: |
           {
             echo "### Release deployed"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Version | \`${{ needs.prepare.outputs.version }}\` |"
+            echo "| Reference type | \`${{ needs.prepare.outputs.ref_type }}\` |"
+            echo "| Reference | \`${{ needs.prepare.outputs.image_ref }}\` |"
             echo "| Environment | \`${{ needs.prepare.outputs.environment }}\` |"
             echo "| Actor | \`${{ needs.prepare.outputs.actor }}\` |"
             echo "| Run | ${{ github.run_id }} |"

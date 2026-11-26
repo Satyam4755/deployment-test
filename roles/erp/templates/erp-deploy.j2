@@ -1,7 +1,7 @@
 #!/bin/bash
-# erp-deploy — deploy a new application image by version tag.
+# erp-deploy — deploy a new application image by semantic version tag or sha256 digest.
 # Runs as root via sudo from the ci-deploy account.
-# Usage: erp-deploy <version>
+# Usage: erp-deploy <version|sha256:digest>
 
 set -euo pipefail
 
@@ -17,21 +17,38 @@ source "$CONFIG_FILE"
 
 # Validate arguments
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <version>" >&2
+    echo "Usage: $0 <version|sha256:digest>" >&2
     exit 1
 fi
 
-VERSION="${1#v}"
+RAW_INPUT="$1"
+REF_TYPE=""
+IMAGE_ID=""
 
-# Validate version format (semver required, latest forbidden)
-if [[ "$VERSION" == "latest" ]]; then
-    echo "ERROR: Deploying tag 'latest' is forbidden. Specify an explicit semantic version (e.g. 1.16.11)." >&2
-    exit 1
-fi
+if [[ "$RAW_INPUT" =~ ^[Ss][Hh][Aa]256: ]]; then
+    DIGEST="$(printf '%s' "$RAW_INPUT" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR: Invalid image digest '$1'. Must be 'sha256:' followed by 64 hexadecimal characters." >&2
+        exit 1
+    fi
+    REF_TYPE="digest"
+    IMAGE_ID="$DIGEST"
+else
+    VERSION="${RAW_INPUT#v}"
 
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-    echo "ERROR: Invalid version format '$1'. Must be a semantic version (e.g. 1.16.11)." >&2
-    exit 1
+    # Validate version format (semver required, latest forbidden)
+    if [[ "$VERSION" == "latest" ]]; then
+        echo "ERROR: Deploying tag 'latest' is forbidden. Specify an explicit semantic version (e.g. 1.16.11) or sha256 digest." >&2
+        exit 1
+    fi
+
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+        echo "ERROR: Invalid image reference '$1'. Must be a semantic version (e.g. 1.16.11 or v1.16.11) or a sha256 digest (sha256:<64 hex chars>)." >&2
+        exit 1
+    fi
+
+    REF_TYPE="version"
+    IMAGE_ID="$VERSION"
 fi
 
 # Log function: progress goes to stdout, which the pipeline captures. The
@@ -55,7 +72,7 @@ record_deploy() {
     chmod 0600 "$DEPLOY_LOG"
     printf '%s environment=%s previous=%s new=%s actor=%s workflow_run=%s result=%s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        "${ENVIRONMENT:-unknown}" "${PREVIOUS_VERSION:-none}" "$VERSION" \
+        "${ENVIRONMENT:-unknown}" "${PREVIOUS_VERSION:-none}" "$IMAGE_ID" \
         "$ACTOR" "$WORKFLOW_RUN" "$result" >> "$DEPLOY_LOG"
 }
 
@@ -63,7 +80,7 @@ PREVIOUS_VERSION="none"
 # A failed deploy is part of the record too. `success` clears the trap.
 trap 'record_deploy failure' EXIT
 
-log "=== Deploy started: version=$VERSION ==="
+log "=== Deploy started: ${REF_TYPE}=${IMAGE_ID} ==="
 log "App directory: $APP_DIR"
 log "Site name: $SITE_NAME"
 
@@ -72,16 +89,23 @@ cd "$APP_DIR"
 # Update the image in compose file. IMAGE_REPO is rendered by Ansible;
 # there is no shell variable with the image name at runtime.
 IMAGE_REPO="{{ erp_image_repository }}"
+REPO_ESC="${IMAGE_REPO//./\\.}"
 
 # Record the version or reference running before the compose file is rewritten.
-PREVIOUS_VERSION="$(grep -oE "${IMAGE_REPO}[:@][^\"[:space:]]+" "$COMPOSE_FILE" | head -n1 | sed -E "s|${IMAGE_REPO}[:@]||" || true)"
+PREVIOUS_VERSION="$(grep -oE "${REPO_ESC}[:@][^\"[:space:]]+" "$COMPOSE_FILE" | head -n1 | sed -E "s|${REPO_ESC}[:@]||" || true)"
 PREVIOUS_VERSION="${PREVIOUS_VERSION:-none}"
 
-log "Updating compose file with image version..."
-sed -i -E "s|image: \"?${IMAGE_REPO}[:@][^\"[:space:]]*\"?|image: \"${IMAGE_REPO}:${VERSION}\"|g" "$COMPOSE_FILE"
+if [[ "$REF_TYPE" == "digest" ]]; then
+    TARGET_IMAGE="${IMAGE_REPO}@${IMAGE_ID}"
+else
+    TARGET_IMAGE="${IMAGE_REPO}:${IMAGE_ID}"
+fi
+
+log "Updating compose file with image reference (${TARGET_IMAGE})..."
+sed -i -E "s|image: \"?${REPO_ESC}[:@][^\"[:space:]]*\"?|image: \"${TARGET_IMAGE}\"|g" "$COMPOSE_FILE"
 
 log "Updating asset-syncer VERSION in compose file..."
-sed -i -E "s|VERSION=\"[^\"]*\"|VERSION=\"${VERSION}\"|g" "$COMPOSE_FILE"
+sed -i -E "s|VERSION=\"[^\"]*\"|VERSION=\"${IMAGE_ID}\"|g" "$COMPOSE_FILE"
 
 # Pull the new image
 log "Pulling image..."
@@ -138,6 +162,6 @@ done
 # Record the deploy
 record_deploy success
 trap - EXIT
-log "Deploy completed successfully: version=$VERSION"
+log "Deploy completed successfully: ${REF_TYPE}=${IMAGE_ID}"
 
 exit 0
